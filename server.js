@@ -326,6 +326,8 @@ async function runMonitoringCycle() {
       status: pingResult.status,
       latency: pingResult.latency,
       uptime: pingResult.connectionInfo?.uptime,
+      rxMB: pingResult.connectionInfo?.rxMB,
+      txMB: pingResult.connectionInfo?.txMB,
     };
 
     // Crear último status
