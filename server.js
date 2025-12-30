@@ -11,8 +11,11 @@ const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 
 async function getConnectionInfo(conn, pppUser) {
   try {
-    // El nombre de la interfaz tiene prefijo "pppoe-"
-    const interfaceName = pppUser.startsWith('pppoe-') ? pppUser : `pppoe-${pppUser}`;
+    // Limpiar el nombre de usuario
+    let cleanUser = pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '');
+
+    // El nombre de la interfaz tiene formato "<pppoe-username>"
+    const interfaceName = `<pppoe-${cleanUser}>`;
     console.log(`[ConnectionInfo] Buscando interfaz: ${interfaceName}`);
 
     // Buscar la interfaz PPPoE del usuario
@@ -23,6 +26,26 @@ async function getConnectionInfo(conn, pppUser) {
     if (interfaces && interfaces.length > 0) {
       const iface = interfaces[0];
       console.log(`[ConnectionInfo] Interfaz encontrada:`, JSON.stringify(iface));
+
+      return {
+        lastLinkUpTime: iface['last-link-up-time'] || null,
+        uptime: iface['uptime'] || null,
+        running: iface['running'] === 'true',
+        disabled: iface['disabled'] === 'true',
+      };
+    }
+
+    // Intentar sin brackets (por si acaso)
+    const altName = `pppoe-${cleanUser}`;
+    console.log(`[ConnectionInfo] Intentando sin brackets: ${altName}`);
+
+    const altInterfaces = await conn.write('/interface/print', [
+      '?name=' + altName,
+    ]);
+
+    if (altInterfaces && altInterfaces.length > 0) {
+      const iface = altInterfaces[0];
+      console.log(`[ConnectionInfo] Interfaz encontrada (alt):`, JSON.stringify(iface));
 
       return {
         lastLinkUpTime: iface['last-link-up-time'] || null,
