@@ -9,7 +9,36 @@ const MIKROTIK_USER = process.env.MIKROTIK_USER || 'mario';
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || 'dnw.25%#D2o%';
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 
-async function pingFromRouter(routerIp, targetIp) {
+async function getConnectionInfo(conn, pppUser) {
+  try {
+    console.log(`[ConnectionInfo] Buscando interfaz para usuario: ${pppUser}`);
+
+    // Buscar la interfaz PPPoE del usuario
+    const interfaces = await conn.write('/interface/print', [
+      '?name=' + pppUser,
+    ]);
+
+    if (interfaces && interfaces.length > 0) {
+      const iface = interfaces[0];
+      console.log(`[ConnectionInfo] Interfaz encontrada:`, JSON.stringify(iface));
+
+      return {
+        lastLinkUpTime: iface['last-link-up-time'] || null,
+        uptime: iface['uptime'] || null,
+        running: iface['running'] === 'true',
+        disabled: iface['disabled'] === 'true',
+      };
+    }
+
+    console.log(`[ConnectionInfo] No se encontró interfaz para ${pppUser}`);
+    return null;
+  } catch (error) {
+    console.error('[ConnectionInfo] Error:', error.message);
+    return null;
+  }
+}
+
+async function pingFromRouter(routerIp, targetIp, pppUser = null) {
   console.log(`[Ping] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
 
   const conn = new RouterOSAPI({
@@ -17,20 +46,28 @@ async function pingFromRouter(routerIp, targetIp) {
     port: MIKROTIK_PORT,
     user: MIKROTIK_USER,
     password: MIKROTIK_PASSWORD,
-    timeout: 10,
+    timeout: 15,
   });
 
   try {
     await conn.connect();
     console.log(`[Ping] Conexión exitosa, ejecutando ping a ${targetIp}...`);
 
+    // Ejecutar ping
     const result = await conn.write('/ping', [
       '=address=' + targetIp,
       '=count=3',
     ]);
 
-    await conn.close();
     console.log(`[Ping] Resultado:`, JSON.stringify(result));
+
+    // Obtener info de conexión si se proporcionó pppUser
+    let connectionInfo = null;
+    if (pppUser) {
+      connectionInfo = await getConnectionInfo(conn, pppUser);
+    }
+
+    await conn.close();
 
     if (result && result.length > 0) {
       let received = 0;
@@ -58,6 +95,7 @@ async function pingFromRouter(routerIp, targetIp) {
           packetLoss,
           clientIp: targetIp,
           message: `${received}/${sent} paquetes recibidos, latencia: ${avgLatency}ms`,
+          connectionInfo,
         };
       } else {
         return {
@@ -66,6 +104,7 @@ async function pingFromRouter(routerIp, targetIp) {
           packetLoss: 100,
           clientIp: targetIp,
           message: 'No se recibieron respuestas (100% packet loss)',
+          connectionInfo,
         };
       }
     }
@@ -75,6 +114,7 @@ async function pingFromRouter(routerIp, targetIp) {
       status: 'error',
       clientIp: targetIp,
       message: 'No se obtuvieron resultados del ping',
+      connectionInfo,
     };
   } catch (error) {
     console.error('[Ping] Error:', error.message);
@@ -120,7 +160,7 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       try {
-        const { ipRouter, clientIp } = JSON.parse(body);
+        const { ipRouter, clientIp, pppUser } = JSON.parse(body);
 
         if (!ipRouter || !clientIp) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -131,8 +171,8 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        console.log(`[Request] Ping desde ${ipRouter} hacia ${clientIp}`);
-        const result = await pingFromRouter(ipRouter, clientIp);
+        console.log(`[Request] Ping desde ${ipRouter} hacia ${clientIp}${pppUser ? ` (user: ${pppUser})` : ''}`);
+        const result = await pingFromRouter(ipRouter, clientIp, pppUser);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -155,4 +195,5 @@ server.listen(PORT, () => {
   console.log(`📡 Endpoints:`);
   console.log(`   GET  /health - Health check`);
   console.log(`   POST /ping   - Ejecutar ping (requiere Authorization header)`);
+  console.log(`                  Body: { ipRouter, clientIp, pppUser? }`);
 });
