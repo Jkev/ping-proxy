@@ -27,9 +27,23 @@ async function getConnectionInfo(conn, pppUser) {
       const iface = interfaces[0];
       console.log(`[ConnectionInfo] Interfaz encontrada:`, JSON.stringify(iface));
 
+      // Calcular uptime desde last-link-up-time
+      let uptime = null;
+      if (iface['last-link-up-time']) {
+        const linkUp = new Date(iface['last-link-up-time'].replace(' ', 'T'));
+        const now = new Date();
+        const diffMs = now - linkUp;
+        const diffHrs = Math.floor(diffMs / 3600000);
+        const diffMins = Math.floor((diffMs % 3600000) / 60000);
+        uptime = `${diffHrs}h ${diffMins}m`;
+      }
+
       return {
         lastLinkUpTime: iface['last-link-up-time'] || null,
-        uptime: iface['uptime'] || null,
+        uptime,
+        linkDowns: parseInt(iface['link-downs'] || '0', 10),
+        rxBytes: parseInt(iface['rx-byte'] || '0', 10),
+        txBytes: parseInt(iface['tx-byte'] || '0', 10),
         running: iface['running'] === 'true',
         disabled: iface['disabled'] === 'true',
       };
@@ -47,9 +61,23 @@ async function getConnectionInfo(conn, pppUser) {
       const iface = altInterfaces[0];
       console.log(`[ConnectionInfo] Interfaz encontrada (alt):`, JSON.stringify(iface));
 
+      // Calcular uptime desde last-link-up-time
+      let uptime = null;
+      if (iface['last-link-up-time']) {
+        const linkUp = new Date(iface['last-link-up-time'].replace(' ', 'T'));
+        const now = new Date();
+        const diffMs = now - linkUp;
+        const diffHrs = Math.floor(diffMs / 3600000);
+        const diffMins = Math.floor((diffMs % 3600000) / 60000);
+        uptime = `${diffHrs}h ${diffMins}m`;
+      }
+
       return {
         lastLinkUpTime: iface['last-link-up-time'] || null,
-        uptime: iface['uptime'] || null,
+        uptime,
+        linkDowns: parseInt(iface['link-downs'] || '0', 10),
+        rxBytes: parseInt(iface['rx-byte'] || '0', 10),
+        txBytes: parseInt(iface['tx-byte'] || '0', 10),
         running: iface['running'] === 'true',
         disabled: iface['disabled'] === 'true',
       };
