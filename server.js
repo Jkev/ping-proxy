@@ -16,6 +16,38 @@ const SHEETBEST_API_URL = process.env.SHEETBEST_API_URL || '';
 
 // ==================== FUNCIONES DE PING ====================
 
+// Parsear fecha de MikroTik (formato: "dec/30/2025 14:30:00" o "2025-12-30 14:30:00")
+function parseMikroTikDate(dateStr) {
+  if (!dateStr) return null;
+
+  // Mapeo de meses abreviados
+  const months = {
+    jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+    jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+  };
+
+  // Intentar formato MikroTik: "dec/30/2025 14:30:00"
+  const mikrotikMatch = dateStr.match(/^([a-z]{3})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/i);
+  if (mikrotikMatch) {
+    const [, monthStr, day, year, hours, minutes, seconds] = mikrotikMatch;
+    const month = months[monthStr.toLowerCase()];
+    if (month !== undefined) {
+      return new Date(parseInt(year), month, parseInt(day), parseInt(hours), parseInt(minutes), parseInt(seconds));
+    }
+  }
+
+  // Intentar formato ISO: "2025-12-30 14:30:00"
+  const isoMatch = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (isoMatch) {
+    const [, year, month, day, hours, minutes, seconds] = isoMatch;
+    return new Date(parseInt(year), parseInt(month) - 1, parseInt(day), parseInt(hours), parseInt(minutes), parseInt(seconds));
+  }
+
+  // Último intento: usar Date constructor directamente
+  const date = new Date(dateStr.replace(' ', 'T'));
+  return isNaN(date.getTime()) ? null : date;
+}
+
 async function getConnectionInfo(conn, pppUser) {
   try {
     // Limpiar el nombre de usuario
@@ -37,12 +69,14 @@ async function getConnectionInfo(conn, pppUser) {
       // Calcular uptime desde last-link-up-time
       let uptime = null;
       if (iface['last-link-up-time']) {
-        const linkUp = new Date(iface['last-link-up-time'].replace(' ', 'T'));
-        const now = new Date();
-        const diffMs = now - linkUp;
-        const diffHrs = Math.floor(diffMs / 3600000);
-        const diffMins = Math.floor((diffMs % 3600000) / 60000);
-        uptime = `${diffHrs}h ${diffMins}m`;
+        const linkUp = parseMikroTikDate(iface['last-link-up-time']);
+        if (linkUp) {
+          const now = new Date();
+          const diffMs = now - linkUp;
+          const diffHrs = Math.floor(diffMs / 3600000);
+          const diffMins = Math.floor((diffMs % 3600000) / 60000);
+          uptime = `${diffHrs}h ${diffMins}m`;
+        }
       }
 
       // Convertir bytes a MB
@@ -75,12 +109,14 @@ async function getConnectionInfo(conn, pppUser) {
       // Calcular uptime desde last-link-up-time
       let uptime = null;
       if (iface['last-link-up-time']) {
-        const linkUp = new Date(iface['last-link-up-time'].replace(' ', 'T'));
-        const now = new Date();
-        const diffMs = now - linkUp;
-        const diffHrs = Math.floor(diffMs / 3600000);
-        const diffMins = Math.floor((diffMs % 3600000) / 60000);
-        uptime = `${diffHrs}h ${diffMins}m`;
+        const linkUp = parseMikroTikDate(iface['last-link-up-time']);
+        if (linkUp) {
+          const now = new Date();
+          const diffMs = now - linkUp;
+          const diffHrs = Math.floor(diffMs / 3600000);
+          const diffMins = Math.floor((diffMs % 3600000) / 60000);
+          uptime = `${diffHrs}h ${diffMins}m`;
+        }
       }
 
       // Convertir bytes a MB
