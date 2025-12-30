@@ -2,6 +2,7 @@ require('dotenv').config();
 const http = require('http');
 const { RouterOSAPI } = require('routeros');
 const cron = require('node-cron');
+const fetch = require('node-fetch');
 
 // Configuración
 const PORT = 3001;
