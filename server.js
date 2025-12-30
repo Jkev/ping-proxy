@@ -1,6 +1,7 @@
 require('dotenv').config();
 const http = require('http');
 const { RouterOSAPI } = require('routeros');
+const cron = require('node-cron');
 
 // Configuración
 const PORT = 3001;
@@ -8,6 +9,13 @@ const API_KEY = process.env.PROXY_API_KEY || 'tu-api-key-secreta-aqui';
 const MIKROTIK_USER = process.env.MIKROTIK_USER || 'mario';
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || 'dnw.25%#D2o%';
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
+
+// SheetBest y MikroWisp config
+const SHEETBEST_API_URL = process.env.SHEETBEST_API_URL || '';
+const MIKROWISP_API_URL = process.env.MIKROWISP_API_URL || '';
+const MIKROWISP_TOKEN = process.env.MIKROWISP_TOKEN || '';
+
+// ==================== FUNCIONES DE PING ====================
 
 async function getConnectionInfo(conn, pppUser) {
   try {
@@ -188,10 +196,224 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
   }
 }
 
+// ==================== FUNCIONES DE MONITOREO AUTOMÁTICO ====================
+
+async function fetchReports() {
+  try {
+    const response = await fetch(SHEETBEST_API_URL);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    console.error('[Monitor] Error fetching reports:', error.message);
+    return [];
+  }
+}
+
+async function getClientData(idCliente) {
+  try {
+    const response = await fetch(`${MIKROWISP_API_URL}/api/v1/GetClientsDetails`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: MIKROWISP_TOKEN,
+        idcliente: parseInt(idCliente, 10),
+      }),
+    });
+
+    const data = await response.json();
+
+    if (data.estado === 'exito' && data.datos?.[0]?.servicios?.[0]) {
+      const servicio = data.datos[0].servicios[0];
+      if (servicio.ip) {
+        return {
+          ip: servicio.ip,
+          pppUser: servicio.pppuser || '',
+        };
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error(`[Monitor] Error getting client data for ${idCliente}:`, error.message);
+    return null;
+  }
+}
+
+async function updateReportInSheetBest(idTicket, updates) {
+  try {
+    const response = await fetch(`${SHEETBEST_API_URL}/idTicket/${idTicket}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+
+    return response.ok;
+  } catch (error) {
+    console.error(`[Monitor] Error updating report ${idTicket}:`, error.message);
+    return false;
+  }
+}
+
+function getCurrentTimestamp() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = (now.getMonth() + 1).toString().padStart(2, '0');
+  const day = now.getDate().toString().padStart(2, '0');
+  const hours = now.getHours().toString().padStart(2, '0');
+  const minutes = now.getMinutes().toString().padStart(2, '0');
+  const seconds = now.getSeconds().toString().padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function parseJsonSafe(str) {
+  if (!str) return null;
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
+
+async function runMonitoringCycle() {
+  console.log('\n========================================');
+  console.log('[Monitor] Iniciando ciclo de monitoreo...');
+  console.log('[Monitor] Timestamp:', getCurrentTimestamp());
+  console.log('========================================\n');
+
+  if (!SHEETBEST_API_URL || !MIKROWISP_API_URL || !MIKROWISP_TOKEN) {
+    console.error('[Monitor] Faltan variables de entorno para monitoreo');
+    return;
+  }
+
+  const reports = await fetchReports();
+  console.log(`[Monitor] Total de reportes: ${reports.length}`);
+
+  // Filtrar reportes activos (no resueltos/cerrados)
+  const activeReports = reports.filter(r => {
+    const estado = (r.estado || '').toLowerCase();
+    return !['resuelto', 'cerrado'].includes(estado);
+  });
+
+  console.log(`[Monitor] Reportes activos: ${activeReports.length}`);
+
+  let processed = 0;
+  let updated = 0;
+  let errors = 0;
+
+  for (const report of activeReports) {
+    processed++;
+    const idTicket = report.idTicket;
+    const idCliente = report.idCliente;
+    const ipRouter = report.ipRouter;
+
+    console.log(`\n[Monitor] [${processed}/${activeReports.length}] Procesando ticket ${idTicket}...`);
+
+    // Parsear historial existente
+    const existingHistory = parseJsonSafe(report.historialMonitoreo) || [];
+
+    // Si no tiene ipRouter, marcar como no monitoreable
+    if (!ipRouter) {
+      console.log(`[Monitor] Ticket ${idTicket}: Sin ipRouter - No monitoreable`);
+
+      const newEntry = {
+        timestamp: getCurrentTimestamp(),
+        status: 'no_monitoreable',
+      };
+
+      const newLastStatus = {
+        status: 'no_monitoreable',
+        timestamp: getCurrentTimestamp(),
+      };
+
+      const success = await updateReportInSheetBest(idTicket, {
+        lastStatusPing: JSON.stringify(newLastStatus),
+        historialMonitoreo: JSON.stringify([...existingHistory, newEntry]),
+      });
+
+      if (success) updated++;
+      else errors++;
+      continue;
+    }
+
+    // Obtener datos del cliente de MikroWisp
+    const clientData = await getClientData(idCliente);
+
+    if (!clientData?.ip) {
+      console.log(`[Monitor] Ticket ${idTicket}: No se pudo obtener IP del cliente`);
+
+      const newEntry = {
+        timestamp: getCurrentTimestamp(),
+        status: 'error',
+      };
+
+      const newLastStatus = {
+        status: 'error',
+        timestamp: getCurrentTimestamp(),
+      };
+
+      const success = await updateReportInSheetBest(idTicket, {
+        lastStatusPing: JSON.stringify(newLastStatus),
+        historialMonitoreo: JSON.stringify([...existingHistory, newEntry]),
+      });
+
+      if (success) updated++;
+      else errors++;
+      continue;
+    }
+
+    // Ejecutar ping
+    console.log(`[Monitor] Ticket ${idTicket}: Ping a ${clientData.ip} via ${ipRouter}`);
+    const pingResult = await pingFromRouter(ipRouter, clientData.ip, clientData.pppUser);
+
+    // Crear entrada de historial
+    const newEntry = {
+      timestamp: getCurrentTimestamp(),
+      status: pingResult.status,
+      latency: pingResult.latency,
+      uptime: pingResult.connectionInfo?.uptime,
+    };
+
+    // Crear último status
+    const newLastStatus = {
+      status: pingResult.status,
+      timestamp: getCurrentTimestamp(),
+      uptime: pingResult.connectionInfo?.uptime,
+      latency: pingResult.latency,
+    };
+
+    console.log(`[Monitor] Ticket ${idTicket}: ${pingResult.status} ${pingResult.latency ? `(${pingResult.latency}ms)` : ''}`);
+
+    // Actualizar en SheetBest
+    const success = await updateReportInSheetBest(idTicket, {
+      lastStatusPing: JSON.stringify(newLastStatus),
+      historialMonitoreo: JSON.stringify([...existingHistory, newEntry]),
+    });
+
+    if (success) {
+      updated++;
+      console.log(`[Monitor] Ticket ${idTicket}: Actualizado correctamente`);
+    } else {
+      errors++;
+      console.log(`[Monitor] Ticket ${idTicket}: Error al actualizar`);
+    }
+
+    // Pequeña pausa para no saturar las APIs
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+
+  console.log('\n========================================');
+  console.log('[Monitor] Ciclo completado');
+  console.log(`[Monitor] Procesados: ${processed}`);
+  console.log(`[Monitor] Actualizados: ${updated}`);
+  console.log(`[Monitor] Errores: ${errors}`);
+  console.log('========================================\n');
+}
+
+// ==================== SERVIDOR HTTP ====================
+
 const server = http.createServer(async (req, res) => {
   // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
@@ -204,6 +426,24 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
+    return;
+  }
+
+  // Endpoint para ejecutar monitoreo manualmente
+  if (req.method === 'POST' && req.url === '/monitor/run') {
+    // Verificar API key
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, message: 'Monitoreo iniciado' }));
+
+    // Ejecutar en background
+    runMonitoringCycle().catch(console.error);
     return;
   }
 
@@ -251,10 +491,26 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ message: 'Not found' }));
 });
 
+// ==================== INICIAR SERVIDOR Y CRON ====================
+
 server.listen(PORT, () => {
-  console.log(`🚀 Ping Proxy corriendo en http://localhost:${PORT}`);
+  console.log(`\n🚀 Ping Proxy corriendo en http://localhost:${PORT}`);
   console.log(`📡 Endpoints:`);
-  console.log(`   GET  /health - Health check`);
-  console.log(`   POST /ping   - Ejecutar ping (requiere Authorization header)`);
-  console.log(`                  Body: { ipRouter, clientIp, pppUser? }`);
+  console.log(`   GET  /health       - Health check`);
+  console.log(`   POST /ping         - Ejecutar ping (requiere Authorization header)`);
+  console.log(`   POST /monitor/run  - Ejecutar monitoreo manual (requiere Authorization header)`);
+  console.log(`\n⏰ Cron job de monitoreo: cada hora`);
+
+  // Configurar cron job para ejecutar cada hora
+  // '0 * * * *' = minuto 0 de cada hora
+  cron.schedule('0 * * * *', () => {
+    console.log('\n[Cron] Ejecutando monitoreo programado...');
+    runMonitoringCycle().catch(console.error);
+  });
+
+  console.log(`\n✅ Servidor listo y cron configurado\n`);
+
+  // Ejecutar monitoreo inicial al arrancar (opcional - descomenta si lo deseas)
+  // console.log('[Startup] Ejecutando monitoreo inicial...');
+  // runMonitoringCycle().catch(console.error);
 });
