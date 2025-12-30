@@ -11,11 +11,13 @@ const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 
 async function getConnectionInfo(conn, pppUser) {
   try {
-    console.log(`[ConnectionInfo] Buscando interfaz para usuario: ${pppUser}`);
+    // El nombre de la interfaz tiene prefijo "pppoe-"
+    const interfaceName = pppUser.startsWith('pppoe-') ? pppUser : `pppoe-${pppUser}`;
+    console.log(`[ConnectionInfo] Buscando interfaz: ${interfaceName}`);
 
     // Buscar la interfaz PPPoE del usuario
     const interfaces = await conn.write('/interface/print', [
-      '?name=' + pppUser,
+      '?name=' + interfaceName,
     ]);
 
     if (interfaces && interfaces.length > 0) {
