@@ -106,6 +106,14 @@ async function getConnectionInfo(conn, pppUser) {
   }
 }
 
+// Timeout wrapper para operaciones que pueden quedarse colgadas
+function withTimeout(promise, ms, errorMsg = 'Timeout') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(errorMsg)), ms))
+  ]);
+}
+
 async function pingFromRouter(routerIp, targetIp, pppUser = null) {
   console.log(`[Ping] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
 
@@ -114,18 +122,20 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
     port: MIKROTIK_PORT,
     user: MIKROTIK_USER,
     password: MIKROTIK_PASSWORD,
-    timeout: 15,
+    timeout: 10,
   });
 
   try {
-    await conn.connect();
+    // Timeout de 15 segundos para la conexión
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
     console.log(`[Ping] Conexión exitosa, ejecutando ping a ${targetIp}...`);
 
-    // Ejecutar ping
-    const result = await conn.write('/ping', [
-      '=address=' + targetIp,
-      '=count=3',
-    ]);
+    // Ejecutar ping con timeout de 20 segundos
+    const result = await withTimeout(
+      conn.write('/ping', ['=address=' + targetIp, '=count=3']),
+      20000,
+      'Timeout ejecutando ping'
+    );
 
     console.log(`[Ping] Resultado:`, JSON.stringify(result));
 
