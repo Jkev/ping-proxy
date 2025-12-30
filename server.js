@@ -11,10 +11,8 @@ const MIKROTIK_USER = process.env.MIKROTIK_USER || 'mario';
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || 'dnw.25%#D2o%';
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 
-// SheetBest y MikroWisp config
+// SheetBest config (ya no se necesita MikroWisp - ipClient viene de SheetBest)
 const SHEETBEST_API_URL = process.env.SHEETBEST_API_URL || '';
-const MIKROWISP_API_URL = process.env.MIKROWISP_API_URL || '';
-const MIKROWISP_TOKEN = process.env.MIKROWISP_TOKEN || '';
 
 // ==================== FUNCIONES DE PING ====================
 
@@ -210,35 +208,6 @@ async function fetchReports() {
   }
 }
 
-async function getClientData(idCliente) {
-  try {
-    const response = await fetch(`${MIKROWISP_API_URL}/api/v1/GetClientsDetails`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        token: MIKROWISP_TOKEN,
-        idcliente: parseInt(idCliente, 10),
-      }),
-    });
-
-    const data = await response.json();
-
-    if (data.estado === 'exito' && data.datos?.[0]?.servicios?.[0]) {
-      const servicio = data.datos[0].servicios[0];
-      if (servicio.ip) {
-        return {
-          ip: servicio.ip,
-          pppUser: servicio.pppuser || '',
-        };
-      }
-    }
-    return null;
-  } catch (error) {
-    console.error(`[Monitor] Error getting client data for ${idCliente}:`, error.message);
-    return null;
-  }
-}
-
 async function updateReportInSheetBest(idTicket, updates) {
   try {
     const response = await fetch(`${SHEETBEST_API_URL}/idTicket/${idTicket}`, {
@@ -280,8 +249,8 @@ async function runMonitoringCycle() {
   console.log('[Monitor] Timestamp:', getCurrentTimestamp());
   console.log('========================================\n');
 
-  if (!SHEETBEST_API_URL || !MIKROWISP_API_URL || !MIKROWISP_TOKEN) {
-    console.error('[Monitor] Faltan variables de entorno para monitoreo');
+  if (!SHEETBEST_API_URL) {
+    console.error('[Monitor] Falta SHEETBEST_API_URL para monitoreo');
     return;
   }
 
@@ -303,17 +272,19 @@ async function runMonitoringCycle() {
   for (const report of activeReports) {
     processed++;
     const idTicket = report.idTicket;
-    const idCliente = report.idCliente;
     const ipRouter = report.ipRouter;
+    const ipClient = report.ipClient;
+    const pppUser = report.pppUser;
 
     console.log(`\n[Monitor] [${processed}/${activeReports.length}] Procesando ticket ${idTicket}...`);
 
     // Parsear historial existente
     const existingHistory = parseJsonSafe(report.historialMonitoreo) || [];
 
-    // Si no tiene ipRouter, marcar como no monitoreable
-    if (!ipRouter) {
-      console.log(`[Monitor] Ticket ${idTicket}: Sin ipRouter - No monitoreable`);
+    // Si no tiene ipRouter o ipClient, marcar como no monitoreable
+    if (!ipRouter || !ipClient) {
+      const reason = !ipRouter ? 'Sin ipRouter' : 'Sin ipClient';
+      console.log(`[Monitor] Ticket ${idTicket}: ${reason} - No monitoreable`);
 
       const newEntry = {
         timestamp: getCurrentTimestamp(),
@@ -335,35 +306,9 @@ async function runMonitoringCycle() {
       continue;
     }
 
-    // Obtener datos del cliente de MikroWisp
-    const clientData = await getClientData(idCliente);
-
-    if (!clientData?.ip) {
-      console.log(`[Monitor] Ticket ${idTicket}: No se pudo obtener IP del cliente`);
-
-      const newEntry = {
-        timestamp: getCurrentTimestamp(),
-        status: 'error',
-      };
-
-      const newLastStatus = {
-        status: 'error',
-        timestamp: getCurrentTimestamp(),
-      };
-
-      const success = await updateReportInSheetBest(idTicket, {
-        lastStatusPing: JSON.stringify(newLastStatus),
-        historialMonitoreo: JSON.stringify([...existingHistory, newEntry]),
-      });
-
-      if (success) updated++;
-      else errors++;
-      continue;
-    }
-
-    // Ejecutar ping
-    console.log(`[Monitor] Ticket ${idTicket}: Ping a ${clientData.ip} via ${ipRouter}`);
-    const pingResult = await pingFromRouter(ipRouter, clientData.ip, clientData.pppUser);
+    // Ejecutar ping (usando ipClient y pppUser directamente de SheetBest)
+    console.log(`[Monitor] Ticket ${idTicket}: Ping a ${ipClient} via ${ipRouter}`);
+    const pingResult = await pingFromRouter(ipRouter, ipClient, pppUser);
 
     // Crear entrada de historial
     const newEntry = {
