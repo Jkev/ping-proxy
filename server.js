@@ -38,12 +38,16 @@ async function getConnectionInfo(conn, pppUser) {
         uptime = `${diffHrs}h ${diffMins}m`;
       }
 
+      // Convertir bytes a MB
+      const rxMB = (parseInt(iface['rx-byte'] || '0', 10) / 1048576).toFixed(2);
+      const txMB = (parseInt(iface['tx-byte'] || '0', 10) / 1048576).toFixed(2);
+
       return {
         lastLinkUpTime: iface['last-link-up-time'] || null,
         uptime,
         linkDowns: parseInt(iface['link-downs'] || '0', 10),
-        rxBytes: parseInt(iface['rx-byte'] || '0', 10),
-        txBytes: parseInt(iface['tx-byte'] || '0', 10),
+        rxMB: parseFloat(rxMB),
+        txMB: parseFloat(txMB),
         running: iface['running'] === 'true',
         disabled: iface['disabled'] === 'true',
       };
@@ -72,12 +76,16 @@ async function getConnectionInfo(conn, pppUser) {
         uptime = `${diffHrs}h ${diffMins}m`;
       }
 
+      // Convertir bytes a MB
+      const rxMB = (parseInt(iface['rx-byte'] || '0', 10) / 1048576).toFixed(2);
+      const txMB = (parseInt(iface['tx-byte'] || '0', 10) / 1048576).toFixed(2);
+
       return {
         lastLinkUpTime: iface['last-link-up-time'] || null,
         uptime,
         linkDowns: parseInt(iface['link-downs'] || '0', 10),
-        rxBytes: parseInt(iface['rx-byte'] || '0', 10),
-        txBytes: parseInt(iface['tx-byte'] || '0', 10),
+        rxMB: parseFloat(rxMB),
+        txMB: parseFloat(txMB),
         running: iface['running'] === 'true',
         disabled: iface['disabled'] === 'true',
       };
