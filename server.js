@@ -166,9 +166,9 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
     console.log(`[Ping] Conexión exitosa, ejecutando ping a ${targetIp}...`);
 
-    // Ejecutar ping con timeout de 20 segundos (a través de interfaz 1010)
+    // Ejecutar ping con timeout de 20 segundos (a través de VLAN 1010)
     const result = await withTimeout(
-      conn.write('/ping', ['=address=' + targetIp, '=count=3', '=interface=1010']),
+      conn.write('/ping', ['=address=' + targetIp, '=count=3', '=interface=VLAN 1010']),
       20000,
       'Timeout ejecutando ping'
     );
