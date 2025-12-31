@@ -48,6 +48,44 @@ function parseMikroTikDate(dateStr) {
   return isNaN(date.getTime()) ? null : date;
 }
 
+// Verificar si el usuario PPPoE tiene sesión activa y obtener su IP real
+async function checkActivePPPoE(conn, pppUser, expectedIp) {
+  try {
+    let cleanUser = pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '');
+    console.log(`[PPPoE] Buscando sesión activa para: ${cleanUser}`);
+
+    // Buscar en las sesiones PPPoE activas
+    const activeSessions = await conn.write('/ppp/active/print', [
+      '?name=' + cleanUser,
+    ]);
+
+    if (activeSessions && activeSessions.length > 0) {
+      const session = activeSessions[0];
+      const actualIp = session.address;
+      console.log(`[PPPoE] Sesión activa encontrada: IP=${actualIp}, caller-id=${session['caller-id']}, uptime=${session.uptime}`);
+
+      if (actualIp !== expectedIp) {
+        console.log(`[PPPoE] ⚠️ ALERTA: IP esperada (${expectedIp}) != IP activa (${actualIp})`);
+      }
+
+      return {
+        active: true,
+        actualIp,
+        expectedIp,
+        ipMismatch: actualIp !== expectedIp,
+        callerId: session['caller-id'],
+        uptime: session.uptime,
+      };
+    }
+
+    console.log(`[PPPoE] ❌ No hay sesión activa para ${cleanUser}`);
+    return { active: false, expectedIp };
+  } catch (error) {
+    console.error('[PPPoE] Error verificando sesión:', error.message);
+    return { active: false, error: error.message };
+  }
+}
+
 async function getConnectionInfo(conn, pppUser) {
   try {
     // Limpiar el nombre de usuario
@@ -173,11 +211,14 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
       'Timeout ejecutando ping'
     );
 
-    console.log(`[Ping] Resultado:`, JSON.stringify(result));
+    console.log(`[Ping] Resultado raw:`, JSON.stringify(result, null, 2));
 
     // Obtener info de conexión si se proporcionó pppUser
     let connectionInfo = null;
+    let pppoeStatus = null;
     if (pppUser) {
+      // Verificar sesión PPPoE activa
+      pppoeStatus = await checkActivePPPoE(conn, pppUser, targetIp);
       connectionInfo = await getConnectionInfo(conn, pppUser);
     }
 
@@ -187,7 +228,12 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
       let received = 0;
       let totalTime = 0;
 
-      for (const item of result) {
+      // Log detallado de cada paquete
+      console.log(`[Ping] Detalle de paquetes:`);
+      for (let i = 0; i < result.length; i++) {
+        const item = result[i];
+        console.log(`[Ping]   Paquete ${i + 1}: host=${item.host || 'N/A'}, time=${item.time || 'timeout'}, ttl=${item.ttl || 'N/A'}, size=${item.size || 'N/A'}`);
+
         if (item.time) {
           received++;
           const timeMatch = item.time.match(/(\d+)/);
@@ -197,11 +243,25 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
         }
       }
 
+      console.log(`[Ping] Resumen: ${received}/3 paquetes recibidos`);
+
       const sent = 3;
       const packetLoss = ((sent - received) / sent) * 100;
       const avgLatency = received > 0 ? Math.round(totalTime / received) : 0;
 
       if (received > 0) {
+        // Verificar si hay advertencias
+        let warning = null;
+        if (pppoeStatus) {
+          if (!pppoeStatus.active) {
+            warning = `⚠️ PING RESPONDE PERO NO HAY SESIÓN PPPoE ACTIVA - La IP ${targetIp} puede estar asignada a otro cliente`;
+            console.log(`[Ping] ${warning}`);
+          } else if (pppoeStatus.ipMismatch) {
+            warning = `⚠️ IP INCORRECTA - El cliente tiene IP ${pppoeStatus.actualIp}, no ${targetIp}`;
+            console.log(`[Ping] ${warning}`);
+          }
+        }
+
         return {
           success: true,
           status: 'online',
@@ -210,6 +270,8 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
           clientIp: targetIp,
           message: `${received}/${sent} paquetes recibidos, latencia: ${avgLatency}ms`,
           connectionInfo,
+          pppoeStatus,
+          warning,
         };
       } else {
         return {
@@ -219,6 +281,7 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
           clientIp: targetIp,
           message: 'No se recibieron respuestas (100% packet loss)',
           connectionInfo,
+          pppoeStatus,
         };
       }
     }
