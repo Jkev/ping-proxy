@@ -166,9 +166,9 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
     console.log(`[Ping] Conexión exitosa, ejecutando ping a ${targetIp}...`);
 
-    // Ejecutar ping con timeout de 20 segundos
+    // Ejecutar ping con timeout de 20 segundos (a través de interfaz 1010)
     const result = await withTimeout(
-      conn.write('/ping', ['=address=' + targetIp, '=count=3']),
+      conn.write('/ping', ['=address=' + targetIp, '=count=3', '=interface=1010']),
       20000,
       'Timeout ejecutando ping'
     );
@@ -270,13 +270,15 @@ async function updateReportInSheetBest(idTicket, updates) {
 }
 
 function getCurrentTimestamp() {
+  // Usar zona horaria de México
   const now = new Date();
-  const year = now.getFullYear();
-  const month = (now.getMonth() + 1).toString().padStart(2, '0');
-  const day = now.getDate().toString().padStart(2, '0');
-  const hours = now.getHours().toString().padStart(2, '0');
-  const minutes = now.getMinutes().toString().padStart(2, '0');
-  const seconds = now.getSeconds().toString().padStart(2, '0');
+  const mexicoTime = new Date(now.toLocaleString('en-US', { timeZone: 'America/Mexico_City' }));
+  const year = mexicoTime.getFullYear();
+  const month = (mexicoTime.getMonth() + 1).toString().padStart(2, '0');
+  const day = mexicoTime.getDate().toString().padStart(2, '0');
+  const hours = mexicoTime.getHours().toString().padStart(2, '0');
+  const minutes = mexicoTime.getMinutes().toString().padStart(2, '0');
+  const seconds = mexicoTime.getSeconds().toString().padStart(2, '0');
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
