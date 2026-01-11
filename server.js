@@ -14,7 +14,7 @@ const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 // SheetBest config (ya no se necesita MikroWisp - ipClient viene de SheetBest)
 const SHEETBEST_API_URL = process.env.SHEETBEST_API_URL || '';
 
-// ==================== FUNCIONES DE PING ====================
+// ==================== FUNCIONES DE ESTADO DE CONEXIÓN ====================
 
 // Parsear fecha de MikroTik (formato: "dec/30/2025 14:30:00" o "2025-12-30 14:30:00")
 function parseMikroTikDate(dateStr) {
@@ -188,8 +188,19 @@ function withTimeout(promise, ms, errorMsg = 'Timeout') {
   ]);
 }
 
-async function pingFromRouter(routerIp, targetIp, pppUser = null) {
-  console.log(`[Ping] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+async function getClientStatus(routerIp, targetIp, pppUser = null) {
+  console.log(`[Status] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+
+  // Si no hay pppUser, no podemos verificar el estado
+  if (!pppUser) {
+    console.log(`[Status] No se proporcionó pppUser - No monitoreable`);
+    return {
+      success: false,
+      status: 'no_monitoreable',
+      clientIp: targetIp,
+      message: 'Se requiere pppUser para verificar estado de conexión',
+    };
+  }
 
   const conn = new RouterOSAPI({
     host: routerIp,
@@ -202,99 +213,54 @@ async function pingFromRouter(routerIp, targetIp, pppUser = null) {
   try {
     // Timeout de 15 segundos para la conexión
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
-    console.log(`[Ping] Conexión exitosa, ejecutando ping a ${targetIp}...`);
+    console.log(`[Status] Conexión exitosa, verificando sesión PPPoE para ${pppUser}...`);
 
-    // Ejecutar ping con timeout de 20 segundos (a través de VLAN 1010)
-    const result = await withTimeout(
-      conn.write('/ping', ['=address=' + targetIp, '=count=3', '=interface=VLAN 1010']),
-      20000,
-      'Timeout ejecutando ping'
-    );
+    // Verificar sesión PPPoE activa
+    const pppoeStatus = await checkActivePPPoE(conn, pppUser, targetIp);
 
-    console.log(`[Ping] Resultado raw:`, JSON.stringify(result, null, 2));
-
-    // Obtener info de conexión si se proporcionó pppUser
-    let connectionInfo = null;
-    let pppoeStatus = null;
-    if (pppUser) {
-      // Verificar sesión PPPoE activa
-      pppoeStatus = await checkActivePPPoE(conn, pppUser, targetIp);
-      connectionInfo = await getConnectionInfo(conn, pppUser);
-    }
+    // Obtener info de conexión
+    const connectionInfo = await getConnectionInfo(conn, pppUser);
 
     await conn.close();
 
-    if (result && result.length > 0) {
-      let received = 0;
-      let totalTime = 0;
+    // Determinar status basado en sesión PPPoE activa
+    const isOnline = pppoeStatus.active === true;
 
-      // Log detallado de cada paquete
-      console.log(`[Ping] Detalle de paquetes:`);
-      for (let i = 0; i < result.length; i++) {
-        const item = result[i];
-        console.log(`[Ping]   Paquete ${i + 1}: host=${item.host || 'N/A'}, time=${item.time || 'timeout'}, ttl=${item.ttl || 'N/A'}, size=${item.size || 'N/A'}`);
-
-        if (item.time) {
-          received++;
-          const timeMatch = item.time.match(/(\d+)/);
-          if (timeMatch) {
-            totalTime += parseInt(timeMatch[1], 10);
-          }
-        }
-      }
-
-      console.log(`[Ping] Resumen: ${received}/3 paquetes recibidos`);
-
-      const sent = 3;
-      const packetLoss = ((sent - received) / sent) * 100;
-      const avgLatency = received > 0 ? Math.round(totalTime / received) : 0;
-
-      if (received > 0) {
-        // Verificar si hay advertencias
-        let warning = null;
-        if (pppoeStatus) {
-          if (!pppoeStatus.active) {
-            warning = `⚠️ PING RESPONDE PERO NO HAY SESIÓN PPPoE ACTIVA - La IP ${targetIp} puede estar asignada a otro cliente`;
-            console.log(`[Ping] ${warning}`);
-          } else if (pppoeStatus.ipMismatch) {
-            warning = `⚠️ IP INCORRECTA - El cliente tiene IP ${pppoeStatus.actualIp}, no ${targetIp}`;
-            console.log(`[Ping] ${warning}`);
-          }
-        }
-
-        return {
-          success: true,
-          status: 'online',
-          latency: avgLatency,
-          packetLoss,
-          clientIp: targetIp,
-          message: `${received}/${sent} paquetes recibidos, latencia: ${avgLatency}ms`,
-          connectionInfo,
-          pppoeStatus,
-          warning,
-        };
-      } else {
-        return {
-          success: true,
-          status: 'offline',
-          packetLoss: 100,
-          clientIp: targetIp,
-          message: 'No se recibieron respuestas (100% packet loss)',
-          connectionInfo,
-          pppoeStatus,
-        };
-      }
+    // Verificar si hay advertencias
+    let warning = null;
+    if (pppoeStatus.active && pppoeStatus.ipMismatch) {
+      warning = `⚠️ IP INCORRECTA - El cliente tiene IP ${pppoeStatus.actualIp}, no ${targetIp}`;
+      console.log(`[Status] ${warning}`);
     }
 
-    return {
-      success: false,
-      status: 'error',
-      clientIp: targetIp,
-      message: 'No se obtuvieron resultados del ping',
-      connectionInfo,
-    };
+    if (isOnline) {
+      console.log(`[Status] Cliente ONLINE - Sesión PPPoE activa, uptime: ${pppoeStatus.uptime || connectionInfo?.uptime || 'N/A'}`);
+      return {
+        success: true,
+        status: 'online',
+        latency: null,
+        packetLoss: null,
+        clientIp: targetIp,
+        message: `Sesión PPPoE activa, uptime: ${pppoeStatus.uptime || connectionInfo?.uptime || 'N/A'}`,
+        connectionInfo,
+        pppoeStatus,
+        warning,
+      };
+    } else {
+      console.log(`[Status] Cliente OFFLINE - No hay sesión PPPoE activa`);
+      return {
+        success: true,
+        status: 'offline',
+        latency: null,
+        packetLoss: null,
+        clientIp: targetIp,
+        message: 'No hay sesión PPPoE activa',
+        connectionInfo,
+        pppoeStatus,
+      };
+    }
   } catch (error) {
-    console.error('[Ping] Error:', error.message);
+    console.error('[Status] Error:', error.message);
     return {
       success: false,
       status: 'error',
@@ -417,29 +383,27 @@ async function runMonitoringCycle() {
       continue;
     }
 
-    // Ejecutar ping (usando ipClient y pppUser directamente de SheetBest)
-    console.log(`[Monitor] Ticket ${idTicket}: Ping a ${ipClient} via ${ipRouter}`);
-    const pingResult = await pingFromRouter(ipRouter, ipClient, pppUser);
+    // Obtener estado del cliente (usando ipClient y pppUser directamente de SheetBest)
+    console.log(`[Monitor] Ticket ${idTicket}: Verificando estado de ${pppUser || ipClient} via ${ipRouter}`);
+    const statusResult = await getClientStatus(ipRouter, ipClient, pppUser);
 
     // Crear entrada de historial
     const newEntry = {
       timestamp: getCurrentTimestamp(),
-      status: pingResult.status,
-      latency: pingResult.latency,
-      uptime: pingResult.connectionInfo?.uptime,
-      rxMB: pingResult.connectionInfo?.rxMB,
-      txMB: pingResult.connectionInfo?.txMB,
+      status: statusResult.status,
+      uptime: statusResult.connectionInfo?.uptime || statusResult.pppoeStatus?.uptime,
+      rxMB: statusResult.connectionInfo?.rxMB,
+      txMB: statusResult.connectionInfo?.txMB,
     };
 
     // Crear último status
     const newLastStatus = {
-      status: pingResult.status,
+      status: statusResult.status,
       timestamp: getCurrentTimestamp(),
-      uptime: pingResult.connectionInfo?.uptime,
-      latency: pingResult.latency,
+      uptime: statusResult.connectionInfo?.uptime || statusResult.pppoeStatus?.uptime,
     };
 
-    console.log(`[Monitor] Ticket ${idTicket}: ${pingResult.status} ${pingResult.latency ? `(${pingResult.latency}ms)` : ''}`);
+    console.log(`[Monitor] Ticket ${idTicket}: ${statusResult.status} (uptime: ${newEntry.uptime || 'N/A'})`);
 
     // Actualizar en SheetBest
     const success = await updateReportInSheetBest(idTicket, {
@@ -531,8 +495,8 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        console.log(`[Request] Ping desde ${ipRouter} hacia ${clientIp}${pppUser ? ` (user: ${pppUser})` : ''}`);
-        const result = await pingFromRouter(ipRouter, clientIp, pppUser);
+        console.log(`[Request] Verificando estado de ${pppUser || clientIp} via ${ipRouter}`);
+        const result = await getClientStatus(ipRouter, clientIp, pppUser);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -553,12 +517,13 @@ const server = http.createServer(async (req, res) => {
 // ==================== INICIAR SERVIDOR Y CRON ====================
 
 server.listen(PORT, () => {
-  console.log(`\n🚀 Ping Proxy corriendo en http://localhost:${PORT}`);
+  console.log(`\n🚀 Status Proxy corriendo en http://localhost:${PORT}`);
   console.log(`📡 Endpoints:`);
   console.log(`   GET  /health       - Health check`);
-  console.log(`   POST /ping         - Ejecutar ping (requiere Authorization header)`);
+  console.log(`   POST /ping         - Verificar estado PPPoE (requiere Authorization header)`);
   console.log(`   POST /monitor/run  - Ejecutar monitoreo manual (requiere Authorization header)`);
-  console.log(`\n⏰ Cron job de monitoreo: cada hora`);
+  console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
+  console.log(`⏰ Cron job de monitoreo: cada hora`);
 
   // Configurar cron job para ejecutar cada hora
   // '0 * * * *' = minuto 0 de cada hora
