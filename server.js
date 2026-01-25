@@ -8,11 +8,12 @@ const fetch = require('node-fetch');
 const PORT = 3001;
 const API_KEY = process.env.PROXY_API_KEY || 'tu-api-key-secreta-aqui';
 const MIKROTIK_USER = process.env.MIKROTIK_USER || 'mario';
-const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || 'dnw.25%#D2o%';
+const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || '';
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 
-// SheetBest config (ya no se necesita MikroWisp - ipClient viene de SheetBest)
-const SHEETBEST_API_URL = process.env.SHEETBEST_API_URL || '';
+// MapaReportesDigy API config (MIGRADO de SheetBest)
+const MAPA_API_URL = process.env.MAPA_REPORTES_API_URL || 'https://mapa-reportes-digy.vercel.app';
+const MAPA_API_KEY = process.env.MAPA_REPORTES_API_KEY || '';
 
 // ==================== FUNCIONES DE ESTADO DE CONEXIÓN ====================
 
@@ -272,28 +273,50 @@ async function getClientStatus(routerIp, targetIp, pppUser = null) {
 
 // ==================== FUNCIONES DE MONITOREO AUTOMÁTICO ====================
 
+// MIGRADO: Ahora usa API de MapaReportesDigy
 async function fetchReports() {
   try {
-    const response = await fetch(SHEETBEST_API_URL);
+    // Usar el nuevo endpoint de pending-monitoring de MapaReportesDigy
+    const response = await fetch(`${MAPA_API_URL}/api/tickets/pending-monitoring`, {
+      method: 'GET',
+      headers: {
+        'X-API-Key': MAPA_API_KEY,
+        'X-Service-Name': 'ping-proxy'
+      }
+    });
+
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
+
+    const data = await response.json();
+
+    // El endpoint devuelve { success, tickets, total }
+    if (data.success && Array.isArray(data.tickets)) {
+      return data.tickets;
+    }
+
+    return [];
   } catch (error) {
     console.error('[Monitor] Error fetching reports:', error.message);
     return [];
   }
 }
 
-async function updateReportInSheetBest(idTicket, updates) {
+// MIGRADO: Ahora actualiza via API de MapaReportesDigy
+async function updateReportMonitoring(ticketId, updates) {
   try {
-    const response = await fetch(`${SHEETBEST_API_URL}/idTicket/${idTicket}`, {
+    const response = await fetch(`${MAPA_API_URL}/api/tickets/${ticketId}/monitoring`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': MAPA_API_KEY,
+        'X-Service-Name': 'ping-proxy'
+      },
       body: JSON.stringify(updates),
     });
 
     return response.ok;
   } catch (error) {
-    console.error(`[Monitor] Error updating report ${idTicket}:`, error.message);
+    console.error(`[Monitor] Error updating report ${ticketId}:`, error.message);
     return false;
   }
 }
@@ -311,52 +334,36 @@ function getCurrentTimestamp() {
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
-function parseJsonSafe(str) {
-  if (!str) return null;
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
-}
-
+// MIGRADO: Ciclo de monitoreo actualizado para usar API de MapaReportesDigy
 async function runMonitoringCycle() {
   console.log('\n========================================');
   console.log('[Monitor] Iniciando ciclo de monitoreo...');
   console.log('[Monitor] Timestamp:', getCurrentTimestamp());
   console.log('========================================\n');
 
-  if (!SHEETBEST_API_URL) {
-    console.error('[Monitor] Falta SHEETBEST_API_URL para monitoreo');
+  if (!MAPA_API_URL || !MAPA_API_KEY) {
+    console.error('[Monitor] Falta MAPA_API_URL o MAPA_API_KEY para monitoreo');
     return;
   }
 
-  const reports = await fetchReports();
-  console.log(`[Monitor] Total de reportes: ${reports.length}`);
-
-  // Filtrar reportes activos (no resueltos/cerrados)
-  const activeReports = reports.filter(r => {
-    const estado = (r.estado || '').toLowerCase();
-    return !['resuelto', 'cerrado'].includes(estado);
-  });
-
-  console.log(`[Monitor] Reportes activos: ${activeReports.length}`);
+  // fetchReports ahora devuelve tickets del endpoint pending-monitoring
+  // Cada ticket tiene: id, idTicket, idCliente, nombreCliente, ipClient, pppUser, ipRouter, routerMkt, estado
+  const tickets = await fetchReports();
+  console.log(`[Monitor] Tickets pendientes de monitoreo: ${tickets.length}`);
 
   let processed = 0;
   let updated = 0;
   let errors = 0;
 
-  for (const report of activeReports) {
+  for (const ticket of tickets) {
     processed++;
-    const idTicket = report.idTicket;
-    const ipRouter = report.ipRouter;
-    const ipClient = report.ipClient;
-    const pppUser = report.pppUser;
+    const ticketId = ticket.id;        // ID del documento en Firebase
+    const idTicket = ticket.idTicket;  // ID de MikroWisp
+    const ipRouter = ticket.ipRouter;
+    const ipClient = ticket.ipClient;
+    const pppUser = ticket.pppUser;
 
-    console.log(`\n[Monitor] [${processed}/${activeReports.length}] Procesando ticket ${idTicket}...`);
-
-    // Parsear historial existente
-    const existingHistory = parseJsonSafe(report.historialMonitoreo) || [];
+    console.log(`\n[Monitor] [${processed}/${tickets.length}] Procesando ticket ${idTicket} (doc: ${ticketId})...`);
 
     // Si no tiene ipRouter o ipClient, marcar como no monitoreable
     if (!ipRouter || !ipClient) {
@@ -364,18 +371,18 @@ async function runMonitoringCycle() {
       console.log(`[Monitor] Ticket ${idTicket}: ${reason} - No monitoreable`);
 
       const newEntry = {
-        timestamp: getCurrentTimestamp(),
+        timestamp: new Date(),
         status: 'no_monitoreable',
       };
 
       const newLastStatus = {
         status: 'no_monitoreable',
-        timestamp: getCurrentTimestamp(),
+        timestamp: new Date(),
       };
 
-      const success = await updateReportInSheetBest(idTicket, {
-        lastStatusPing: JSON.stringify(newLastStatus),
-        historialMonitoreo: JSON.stringify([...existingHistory, newEntry]),
+      const success = await updateReportMonitoring(ticketId, {
+        lastStatusPing: newLastStatus,
+        historialMonitoreo: [newEntry],
       });
 
       if (success) updated++;
@@ -383,13 +390,13 @@ async function runMonitoringCycle() {
       continue;
     }
 
-    // Obtener estado del cliente (usando ipClient y pppUser directamente de SheetBest)
+    // Obtener estado del cliente
     console.log(`[Monitor] Ticket ${idTicket}: Verificando estado de ${pppUser || ipClient} via ${ipRouter}`);
     const statusResult = await getClientStatus(ipRouter, ipClient, pppUser);
 
     // Crear entrada de historial
     const newEntry = {
-      timestamp: getCurrentTimestamp(),
+      timestamp: new Date(),
       status: statusResult.status,
       uptime: statusResult.connectionInfo?.uptime || statusResult.pppoeStatus?.uptime,
       rxMB: statusResult.connectionInfo?.rxMB,
@@ -399,16 +406,33 @@ async function runMonitoringCycle() {
     // Crear último status
     const newLastStatus = {
       status: statusResult.status,
-      timestamp: getCurrentTimestamp(),
+      timestamp: new Date(),
       uptime: statusResult.connectionInfo?.uptime || statusResult.pppoeStatus?.uptime,
     };
 
-    console.log(`[Monitor] Ticket ${idTicket}: ${statusResult.status} (uptime: ${newEntry.uptime || 'N/A'})`);
+    // Determinar si bloquear cierre (noCerrar) - online con uptime < 1 hora
+    let noCerrar = false;
+    if (statusResult.status === 'online') {
+      const uptimeStr = newLastStatus.uptime || '';
+      // Parsear uptime en formato "Xh Ym"
+      const hoursMatch = uptimeStr.match(/(\d+)h/);
+      const hours = hoursMatch ? parseInt(hoursMatch[1], 10) : 0;
+      noCerrar = hours < 1;
+    }
 
-    // Actualizar en SheetBest
-    const success = await updateReportInSheetBest(idTicket, {
-      lastStatusPing: JSON.stringify(newLastStatus),
-      historialMonitoreo: JSON.stringify([...existingHistory, newEntry]),
+    // Determinar si hay bajo consumo
+    const rxMB = statusResult.connectionInfo?.rxMB || 0;
+    const txMB = statusResult.connectionInfo?.txMB || 0;
+    const bajoConsumo = rxMB < 100 && txMB < 100;
+
+    console.log(`[Monitor] Ticket ${idTicket}: ${statusResult.status} (uptime: ${newEntry.uptime || 'N/A'}, noCerrar: ${noCerrar}, bajoConsumo: ${bajoConsumo})`);
+
+    // Actualizar via API de MapaReportesDigy
+    const success = await updateReportMonitoring(ticketId, {
+      lastStatusPing: newLastStatus,
+      historialMonitoreo: [newEntry],
+      noCerrar,
+      bajoConsumo,
     });
 
     if (success) {
