@@ -15,6 +15,10 @@ const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
 const MAPA_API_URL = process.env.MAPA_REPORTES_API_URL || 'https://mapa-reportes-digy.vercel.app';
 const MAPA_API_KEY = process.env.MAPA_REPORTES_API_KEY || '';
 
+// SmartOLT API config (solo Huawei)
+const SMARTOLT_URL = process.env.SMARTOLT_URL || 'https://digynetworks.smartolt.com';
+const SMARTOLT_API_KEY = process.env.SMARTOLT_API_KEY || '';
+
 // ==================== FUNCIONES DE ESTADO DE CONEXIÓN ====================
 
 // Parsear fecha de MikroTik (formato: "dec/30/2025 14:30:00" o "2025-12-30 14:30:00")
@@ -333,6 +337,129 @@ async function disconnectPPPoE(routerIp, pppUser) {
   }
 }
 
+// ==================== REBOOT ONT VÍA SMARTOLT (HUAWEI) ====================
+
+// Cache de OLTs: IP → olt_id
+let oltsCache = null;
+let oltsCacheTime = 0;
+const OLTS_CACHE_TTL = 3600000; // 1 hora
+
+async function getOltsMap() {
+  if (oltsCache && Date.now() - oltsCacheTime < OLTS_CACHE_TTL) return oltsCache;
+
+  try {
+    const res = await fetch(`${SMARTOLT_URL}/api/system/get_olts`, {
+      headers: { 'X-Token': SMARTOLT_API_KEY },
+    });
+    const data = await res.json();
+    if (!data.status) return null;
+
+    // Mapear IP → olt_id
+    const map = {};
+    for (const olt of data.response) {
+      map[olt.ip] = olt.id;
+      map[olt.name] = olt.id;
+    }
+    oltsCache = map;
+    oltsCacheTime = Date.now();
+    return map;
+  } catch (err) {
+    console.error('[SmartOLT] Error obteniendo OLTs:', err.message);
+    return null;
+  }
+}
+
+async function findOnuByUsername(oltId, pppUser) {
+  let cleanUser = pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '');
+  console.log(`[SmartOLT] Buscando ONU con username=${cleanUser} en OLT ${oltId}...`);
+
+  try {
+    const res = await fetch(`${SMARTOLT_URL}/api/onu/get_all_onus_details?olt_id=${oltId}`, {
+      headers: { 'X-Token': SMARTOLT_API_KEY },
+    });
+    const data = await res.json();
+
+    if (!data.status || !data.onus) {
+      console.log('[SmartOLT] No se obtuvieron ONUs');
+      return null;
+    }
+
+    const onu = data.onus.find(o => o.username === cleanUser);
+    if (onu) {
+      console.log(`[SmartOLT] ONU encontrada: id=${onu.unique_external_id}, sn=${onu.sn}, nombre=${onu.name}`);
+      return onu;
+    }
+
+    console.log(`[SmartOLT] No se encontró ONU con username=${cleanUser}`);
+    return null;
+  } catch (err) {
+    console.error('[SmartOLT] Error buscando ONU:', err.message);
+    return null;
+  }
+}
+
+async function rebootOnt(routerIp, pppUser) {
+  console.log(`[RebootONT] Iniciando reboot para ${pppUser} en router ${routerIp}...`);
+
+  if (!SMARTOLT_API_KEY) {
+    return { success: false, message: 'SmartOLT API key no configurada' };
+  }
+
+  if (!pppUser) {
+    return { success: false, message: 'Se requiere pppUser para reboot ONT' };
+  }
+
+  try {
+    // 1. Mapear IP del router → OLT ID
+    const oltsMap = await getOltsMap();
+    if (!oltsMap) {
+      return { success: false, message: 'No se pudo obtener lista de OLTs' };
+    }
+
+    const oltId = oltsMap[routerIp];
+    if (!oltId) {
+      return { success: false, message: `Router IP ${routerIp} no corresponde a ninguna OLT en SmartOLT` };
+    }
+
+    // 2. Buscar ONU por username PPPoE
+    const onu = await findOnuByUsername(oltId, pppUser);
+    if (!onu) {
+      return { success: false, message: `No se encontró ONU con username ${pppUser} en OLT ${oltId}` };
+    }
+
+    // 3. Reboot
+    const onuId = onu.unique_external_id;
+    console.log(`[RebootONT] Enviando reboot a ONU ${onuId} (${onu.sn})...`);
+
+    const rebootRes = await fetch(`${SMARTOLT_URL}/api/onu/reboot/${onuId}`, {
+      method: 'POST',
+      headers: { 'X-Token': SMARTOLT_API_KEY },
+    });
+    const rebootData = await rebootRes.json();
+
+    if (rebootData.status) {
+      console.log(`[RebootONT] ✅ Reboot enviado exitosamente a ONU ${onuId}`);
+      return {
+        success: true,
+        message: `Reboot enviado a ONU ${onu.sn} (${onu.name})`,
+        onu: {
+          id: onuId,
+          sn: onu.sn,
+          name: onu.name,
+          username: onu.username,
+          oltName: onu.olt_name,
+        },
+      };
+    } else {
+      console.log(`[RebootONT] ❌ Error en reboot: ${rebootData.error}`);
+      return { success: false, message: rebootData.error || 'Error enviando reboot' };
+    }
+  } catch (err) {
+    console.error('[RebootONT] Error:', err.message);
+    return { success: false, message: err.message || 'Error en reboot ONT' };
+  }
+}
+
 // ==================== FUNCIONES DE MONITOREO AUTOMÁTICO ====================
 
 // MIGRADO: Ahora usa API de MapaReportesDigy
@@ -633,6 +760,44 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Reboot ONT vía SmartOLT (Huawei)
+  if (req.method === 'POST' && req.url === '/ont/reboot') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { ipRouter, pppUser } = JSON.parse(body);
+
+        if (!ipRouter || !pppUser) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Faltan parámetros: ipRouter, pppUser'
+          }));
+          return;
+        }
+
+        console.log(`[Request] Reboot ONT ${pppUser} en ${ipRouter}`);
+        const result = await rebootOnt(ipRouter, pppUser);
+
+        res.writeHead(result.success ? 200 : 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
   // 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ message: 'Not found' }));
@@ -645,7 +810,8 @@ server.listen(PORT, () => {
   console.log(`📡 Endpoints:`);
   console.log(`   GET  /health       - Health check`);
   console.log(`   POST /ping            - Verificar estado PPPoE (requiere Authorization header)`);
-  console.log(`   POST /ppp/disconnect  - Desconectar sesión PPPoE (requiere Authorization header)`);
+  console.log(`   POST /ppp/disconnect  - Desconectar sesión PPPoE MikroTik (requiere Authorization header)`);
+  console.log(`   POST /ont/reboot      - Reboot ONT vía SmartOLT Huawei (requiere Authorization header)`);
   console.log(`   POST /monitor/run     - Ejecutar monitoreo manual (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
