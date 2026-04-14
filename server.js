@@ -91,6 +91,42 @@ async function checkActivePPPoE(conn, pppUser, expectedIp) {
   }
 }
 
+function extractInterfaceInfo(iface) {
+  // Calcular uptime desde last-link-up-time
+  let uptime = null;
+  if (iface['last-link-up-time']) {
+    const linkUp = parseMikroTikDate(iface['last-link-up-time']);
+    if (linkUp) {
+      // Usar hora de México para comparar con la hora del router (también en México)
+      const nowMx = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Mexico_City' }));
+      const diffMs = nowMx - linkUp;
+      if (diffMs >= 0) {
+        const diffHrs = Math.floor(diffMs / 3600000);
+        const diffMins = Math.floor((diffMs % 3600000) / 60000);
+        uptime = `${diffHrs}h ${diffMins}m`;
+      } else {
+        // Si es negativo, la hora del router está adelantada — mostrar como recién conectado
+        uptime = `0h 0m`;
+        console.log(`[ConnectionInfo] Uptime negativo (${diffMs}ms), ajustando a 0h 0m. linkUp=${iface['last-link-up-time']}, nowMx=${nowMx.toISOString()}`);
+      }
+    }
+  }
+
+  // Convertir bytes a MB
+  const rxMB = (parseInt(iface['rx-byte'] || '0', 10) / 1048576).toFixed(2);
+  const txMB = (parseInt(iface['tx-byte'] || '0', 10) / 1048576).toFixed(2);
+
+  return {
+    lastLinkUpTime: iface['last-link-up-time'] || null,
+    uptime,
+    linkDowns: parseInt(iface['link-downs'] || '0', 10),
+    rxMB: parseFloat(rxMB),
+    txMB: parseFloat(txMB),
+    running: iface['running'] === 'true',
+    disabled: iface['disabled'] === 'true',
+  };
+}
+
 async function getConnectionInfo(conn, pppUser) {
   try {
     // Limpiar el nombre de usuario
@@ -109,32 +145,7 @@ async function getConnectionInfo(conn, pppUser) {
       const iface = interfaces[0];
       console.log(`[ConnectionInfo] Interfaz encontrada:`, JSON.stringify(iface));
 
-      // Calcular uptime desde last-link-up-time
-      let uptime = null;
-      if (iface['last-link-up-time']) {
-        const linkUp = parseMikroTikDate(iface['last-link-up-time']);
-        if (linkUp) {
-          const now = new Date();
-          const diffMs = now - linkUp;
-          const diffHrs = Math.floor(diffMs / 3600000);
-          const diffMins = Math.floor((diffMs % 3600000) / 60000);
-          uptime = `${diffHrs}h ${diffMins}m`;
-        }
-      }
-
-      // Convertir bytes a MB
-      const rxMB = (parseInt(iface['rx-byte'] || '0', 10) / 1048576).toFixed(2);
-      const txMB = (parseInt(iface['tx-byte'] || '0', 10) / 1048576).toFixed(2);
-
-      return {
-        lastLinkUpTime: iface['last-link-up-time'] || null,
-        uptime,
-        linkDowns: parseInt(iface['link-downs'] || '0', 10),
-        rxMB: parseFloat(rxMB),
-        txMB: parseFloat(txMB),
-        running: iface['running'] === 'true',
-        disabled: iface['disabled'] === 'true',
-      };
+      return extractInterfaceInfo(iface);
     }
 
     // Intentar sin brackets (por si acaso)
@@ -149,32 +160,7 @@ async function getConnectionInfo(conn, pppUser) {
       const iface = altInterfaces[0];
       console.log(`[ConnectionInfo] Interfaz encontrada (alt):`, JSON.stringify(iface));
 
-      // Calcular uptime desde last-link-up-time
-      let uptime = null;
-      if (iface['last-link-up-time']) {
-        const linkUp = parseMikroTikDate(iface['last-link-up-time']);
-        if (linkUp) {
-          const now = new Date();
-          const diffMs = now - linkUp;
-          const diffHrs = Math.floor(diffMs / 3600000);
-          const diffMins = Math.floor((diffMs % 3600000) / 60000);
-          uptime = `${diffHrs}h ${diffMins}m`;
-        }
-      }
-
-      // Convertir bytes a MB
-      const rxMB = (parseInt(iface['rx-byte'] || '0', 10) / 1048576).toFixed(2);
-      const txMB = (parseInt(iface['tx-byte'] || '0', 10) / 1048576).toFixed(2);
-
-      return {
-        lastLinkUpTime: iface['last-link-up-time'] || null,
-        uptime,
-        linkDowns: parseInt(iface['link-downs'] || '0', 10),
-        rxMB: parseFloat(rxMB),
-        txMB: parseFloat(txMB),
-        running: iface['running'] === 'true',
-        disabled: iface['disabled'] === 'true',
-      };
+      return extractInterfaceInfo(iface);
     }
 
     console.log(`[ConnectionInfo] No se encontró interfaz para ${pppUser}`);
