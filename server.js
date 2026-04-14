@@ -271,6 +271,68 @@ async function getClientStatus(routerIp, targetIp, pppUser = null) {
   }
 }
 
+// ==================== DESCONEXIÓN PPPoE ====================
+
+async function disconnectPPPoE(routerIp, pppUser) {
+  console.log(`[Disconnect] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+
+  if (!pppUser) {
+    return { success: false, message: 'Se requiere pppUser para desconectar sesión' };
+  }
+
+  const conn = new RouterOSAPI({
+    host: routerIp,
+    port: MIKROTIK_PORT,
+    user: MIKROTIK_USER,
+    password: MIKROTIK_PASSWORD,
+    timeout: 10,
+  });
+
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+
+    let cleanUser = pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '');
+    console.log(`[Disconnect] Buscando sesión activa para: ${cleanUser}`);
+
+    // Buscar la sesión activa
+    const activeSessions = await conn.write('/ppp/active/print', [
+      '?name=' + cleanUser,
+    ]);
+
+    if (!activeSessions || activeSessions.length === 0) {
+      await conn.close();
+      console.log(`[Disconnect] No hay sesión activa para ${cleanUser}`);
+      return { success: false, message: `No hay sesión PPPoE activa para ${cleanUser}` };
+    }
+
+    const session = activeSessions[0];
+    const sessionId = session['.id'];
+    console.log(`[Disconnect] Sesión encontrada: id=${sessionId}, IP=${session.address}, uptime=${session.uptime}`);
+
+    // Remover la sesión activa
+    await conn.write('/ppp/active/remove', [
+      '=.id=' + sessionId,
+    ]);
+
+    await conn.close();
+    console.log(`[Disconnect] ✅ Sesión PPPoE de ${cleanUser} desconectada exitosamente`);
+
+    return {
+      success: true,
+      message: `Sesión PPPoE de ${cleanUser} desconectada`,
+      disconnectedSession: {
+        name: cleanUser,
+        ip: session.address,
+        uptime: session.uptime,
+        callerId: session['caller-id'],
+      },
+    };
+  } catch (error) {
+    console.error('[Disconnect] Error:', error.message);
+    return { success: false, message: error.message || 'Error desconectando sesión' };
+  }
+}
+
 // ==================== FUNCIONES DE MONITOREO AUTOMÁTICO ====================
 
 // MIGRADO: Ahora usa API de MapaReportesDigy
@@ -533,6 +595,44 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Desconectar sesión PPPoE
+  if (req.method === 'POST' && req.url === '/ppp/disconnect') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { ipRouter, pppUser } = JSON.parse(body);
+
+        if (!ipRouter || !pppUser) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Faltan parámetros: ipRouter, pppUser'
+          }));
+          return;
+        }
+
+        console.log(`[Request] Desconectando PPPoE ${pppUser} en ${ipRouter}`);
+        const result = await disconnectPPPoE(ipRouter, pppUser);
+
+        res.writeHead(result.success ? 200 : 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
   // 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ message: 'Not found' }));
@@ -544,8 +644,9 @@ server.listen(PORT, () => {
   console.log(`\n🚀 Status Proxy corriendo en http://localhost:${PORT}`);
   console.log(`📡 Endpoints:`);
   console.log(`   GET  /health       - Health check`);
-  console.log(`   POST /ping         - Verificar estado PPPoE (requiere Authorization header)`);
-  console.log(`   POST /monitor/run  - Ejecutar monitoreo manual (requiere Authorization header)`);
+  console.log(`   POST /ping            - Verificar estado PPPoE (requiere Authorization header)`);
+  console.log(`   POST /ppp/disconnect  - Desconectar sesión PPPoE (requiere Authorization header)`);
+  console.log(`   POST /monitor/run     - Ejecutar monitoreo manual (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
 
