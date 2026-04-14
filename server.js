@@ -53,6 +53,22 @@ function parseMikroTikDate(dateStr) {
   return isNaN(date.getTime()) ? null : date;
 }
 
+// Parsear uptime de MikroTik (formato: "1w2d12h8m50s") a "Xh Ym"
+function parseMikroTikUptime(uptimeStr) {
+  if (!uptimeStr) return null;
+  const weeks = uptimeStr.match(/(\d+)w/);
+  const days = uptimeStr.match(/(\d+)d/);
+  const hours = uptimeStr.match(/(\d+)h/);
+  const minutes = uptimeStr.match(/(\d+)m(?!s)/);
+
+  const totalHours = (weeks ? parseInt(weeks[1]) * 168 : 0) +
+    (days ? parseInt(days[1]) * 24 : 0) +
+    (hours ? parseInt(hours[1]) : 0);
+  const mins = minutes ? parseInt(minutes[1]) : 0;
+
+  return `${totalHours}h ${mins}m`;
+}
+
 // Verificar si el usuario PPPoE tiene sesión activa y obtener su IP real
 async function checkActivePPPoE(conn, pppUser, expectedIp) {
   try {
@@ -226,7 +242,7 @@ async function getClientStatus(routerIp, targetIp, pppUser = null) {
 
     // Preferir uptime de la sesión PPPoE activa (más preciso que last-link-up-time de la interfaz)
     if (isOnline && pppoeStatus.uptime && connectionInfo) {
-      connectionInfo.uptime = pppoeStatus.uptime;
+      connectionInfo.uptime = parseMikroTikUptime(pppoeStatus.uptime);
     }
 
     if (isOnline) {
