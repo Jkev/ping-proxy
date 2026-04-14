@@ -224,15 +224,20 @@ async function getClientStatus(routerIp, targetIp, pppUser = null) {
       console.log(`[Status] ${warning}`);
     }
 
+    // Preferir uptime de la sesión PPPoE activa (más preciso que last-link-up-time de la interfaz)
+    if (isOnline && pppoeStatus.uptime && connectionInfo) {
+      connectionInfo.uptime = pppoeStatus.uptime;
+    }
+
     if (isOnline) {
-      console.log(`[Status] Cliente ONLINE - Sesión PPPoE activa, uptime: ${pppoeStatus.uptime || connectionInfo?.uptime || 'N/A'}`);
+      console.log(`[Status] Cliente ONLINE - Sesión PPPoE activa, uptime: ${connectionInfo?.uptime || pppoeStatus.uptime || 'N/A'}`);
       return {
         success: true,
         status: 'online',
         latency: null,
         packetLoss: null,
         clientIp: targetIp,
-        message: `Sesión PPPoE activa, uptime: ${pppoeStatus.uptime || connectionInfo?.uptime || 'N/A'}`,
+        message: `Sesión PPPoE activa, uptime: ${connectionInfo?.uptime || pppoeStatus.uptime || 'N/A'}`,
         connectionInfo,
         pppoeStatus,
         warning,
