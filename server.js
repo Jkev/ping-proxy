@@ -417,26 +417,39 @@ async function rebootOnt(routerIp, pppUser) {
   }
 
   try {
-    // 1. Mapear IP del router → OLT ID
+    // 1. Obtener lista de OLTs de SmartOLT
     const oltsMap = await getOltsMap();
     if (!oltsMap) {
-      return { success: false, message: 'No se pudo obtener lista de OLTs' };
+      return { success: false, message: 'No se pudo obtener lista de OLTs de SmartOLT' };
     }
 
-    const oltId = oltsMap[routerIp];
-    if (!oltId) {
-      return { success: false, message: `Router IP ${routerIp} no corresponde a ninguna OLT en SmartOLT` };
+    // 2. routerIp es el MikroTik (BNG), NO la OLT — no se puede mapear directo.
+    //    Iterar sobre todas las OLTs Huawei buscando el ONU por pppUser.
+    const uniqueOltIds = [...new Set(Object.values(oltsMap))];
+    console.log(`[RebootONT] Buscando ONU ${pppUser} en ${uniqueOltIds.length} OLT(s) de SmartOLT...`);
+
+    let onu = null;
+    let foundOltId = null;
+    for (const oltId of uniqueOltIds) {
+      const candidate = await findOnuByUsername(oltId, pppUser);
+      if (candidate) {
+        onu = candidate;
+        foundOltId = oltId;
+        break;
+      }
     }
 
-    // 2. Buscar ONU por username PPPoE
-    const onu = await findOnuByUsername(oltId, pppUser);
     if (!onu) {
-      return { success: false, message: `No se encontró ONU con username ${pppUser} en OLT ${oltId}` };
+      return {
+        success: false,
+        message: `ONU con username ${pppUser} no encontrada en ninguna OLT Huawei (routerIp ${routerIp}). ` +
+                 `Probablemente el cliente está detrás de un OLT V-sol (no soportado por SmartOLT).`
+      };
     }
 
     // 3. Reboot
     const onuId = onu.unique_external_id;
-    console.log(`[RebootONT] Enviando reboot a ONU ${onuId} (${onu.sn})...`);
+    console.log(`[RebootONT] Enviando reboot a ONU ${onuId} (${onu.sn}) en OLT ${foundOltId}...`);
 
     const rebootRes = await fetch(`${SMARTOLT_URL}/api/onu/reboot/${onuId}`, {
       method: 'POST',
