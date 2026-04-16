@@ -344,6 +344,39 @@ async function disconnectPPPoE(routerIp, pppUser) {
   }
 }
 
+// ==================== LISTAR SESIONES PPPoE ACTIVAS ====================
+
+async function listActivePPPoESessions(routerIp) {
+  console.log(`[PPPListActive] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+
+  const conn = new RouterOSAPI({
+    host: routerIp,
+    port: MIKROTIK_PORT,
+    user: MIKROTIK_USER,
+    password: MIKROTIK_PASSWORD,
+    timeout: 10,
+  });
+
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+    const sessions = await conn.write('/ppp/active/print');
+    await conn.close();
+
+    const normalized = (sessions || []).map(s => ({
+      name: s.name || '',
+      address: s.address || '',
+      uptime: s.uptime || '',
+      callerId: s['caller-id'] || '',
+    }));
+
+    console.log(`[PPPListActive] ${routerIp}: ${normalized.length} sesiones activas`);
+    return { success: true, count: normalized.length, sessions: normalized };
+  } catch (error) {
+    console.error(`[PPPListActive] Error en ${routerIp}:`, error.message);
+    return { success: false, count: 0, sessions: [], message: error.message || 'Error consultando sesiones' };
+  }
+}
+
 // ==================== REBOOT ONT VÍA SMARTOLT (HUAWEI) ====================
 
 // Cache de OLTs: IP → olt_id
@@ -770,6 +803,44 @@ const server = http.createServer(async (req, res) => {
         const result = await disconnectPPPoE(ipRouter, pppUser);
 
         res.writeHead(result.success ? 200 : 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Listar sesiones PPPoE activas de un router
+  if (req.method === 'POST' && req.url === '/ppp/list-active') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { ipRouter } = JSON.parse(body);
+
+        if (!ipRouter) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Falta parámetro: ipRouter'
+          }));
+          return;
+        }
+
+        console.log(`[Request] Listando sesiones PPPoE activas en ${ipRouter}`);
+        const result = await listActivePPPoESessions(ipRouter);
+
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (error) {
         console.error('[Error]', error);
