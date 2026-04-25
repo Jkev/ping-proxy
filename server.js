@@ -437,6 +437,67 @@ async function clearFirewallAddressList(routerIp, listName) {
   }
 }
 
+async function clearFirewallAddressListBatch(routers, listName, concurrency) {
+  console.log(`[FirewallAddressListBatch] Iniciando: ${routers.length} routers, list="${listName}", concurrencia=${concurrency}`);
+  const t0 = Date.now();
+  const results = new Array(routers.length);
+  let cursor = 0;
+  let processed = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= routers.length) return;
+      const ipRouter = routers[idx];
+      const start = Date.now();
+      try {
+        const r = await clearFirewallAddressList(ipRouter, listName);
+        const elapsed = Date.now() - start;
+        results[idx] = {
+          ipRouter,
+          success: r.success === true,
+          removed: r.removed || 0,
+          message: r.message,
+          elapsed,
+        };
+      } catch (err) {
+        results[idx] = {
+          ipRouter,
+          success: false,
+          removed: 0,
+          message: err.message || 'Error desconocido',
+          elapsed: Date.now() - start,
+        };
+      }
+      processed++;
+      console.log(`[FirewallAddressListBatch] [${processed}/${routers.length}] ${ipRouter}: ${results[idx].success ? '✅' : '❌'} (${results[idx].elapsed}ms)`);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(concurrency, routers.length) }, () => worker());
+  await Promise.all(runners);
+
+  const ok = results.filter(r => r.success);
+  const failed = results.filter(r => !r.success);
+  const totalRemoved = ok.reduce((sum, r) => sum + (r.removed || 0), 0);
+  const totalElapsed = Date.now() - t0;
+
+  console.log(`[FirewallAddressListBatch] Completado en ${(totalElapsed / 1000).toFixed(1)}s — ${ok.length} ok, ${failed.length} fail, ${totalRemoved} entradas removidas`);
+
+  return {
+    success: true,
+    summary: {
+      total: results.length,
+      ok: ok.length,
+      failed: failed.length,
+      totalRemoved,
+      elapsedMs: totalElapsed,
+    },
+    listName,
+    results,
+  };
+}
+
 // ==================== REBOOT ONT VÍA SMARTOLT (HUAWEI) ====================
 
 // Cache de OLTs: IP → olt_id
@@ -949,6 +1010,57 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Limpiar address-list en batch (varios routers a la vez)
+  if (req.method === 'POST' && req.url === '/firewall/address-list/clear-batch') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { listName, routers, concurrency } = JSON.parse(body);
+
+        if (!listName || !Array.isArray(routers) || routers.length === 0) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Faltan parámetros: listName (string), routers (array no vacío de IPs)'
+          }));
+          return;
+        }
+
+        // Validar que todas las entradas sean strings
+        if (!routers.every(r => typeof r === 'string' && r.length > 0)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'routers debe ser un array de IPs (strings)'
+          }));
+          return;
+        }
+
+        // Concurrencia: default 10, mínimo 1, máximo 20
+        const conc = Math.min(Math.max(parseInt(concurrency || 10, 10) || 10, 1), 20);
+
+        console.log(`[Request] Batch clear address-list "${listName}" en ${routers.length} routers (concurrencia=${conc})`);
+        const result = await clearFirewallAddressListBatch(routers, listName, conc);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno: ' + error.message }));
+      }
+    });
+    return;
+  }
+
   // Reboot ONT vía SmartOLT (Huawei)
   if (req.method === 'POST' && req.url === '/ont/reboot') {
     const authHeader = req.headers['authorization'];
@@ -1001,7 +1113,8 @@ server.listen(PORT, () => {
   console.log(`   POST /ping            - Verificar estado PPPoE (requiere Authorization header)`);
   console.log(`   POST /ppp/disconnect  - Desconectar sesión PPPoE MikroTik (requiere Authorization header)`);
   console.log(`   POST /ont/reboot      - Reboot ONT vía SmartOLT Huawei (requiere Authorization header)`);
-  console.log(`   POST /firewall/address-list/clear - Limpiar address-list MikroTik (requiere Authorization header)`);
+  console.log(`   POST /firewall/address-list/clear       - Limpiar address-list MikroTik (requiere Authorization header)`);
+  console.log(`   POST /firewall/address-list/clear-batch - Limpiar address-list en varios routers (requiere Authorization header)`);
   console.log(`   POST /monitor/run     - Ejecutar monitoreo manual (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
