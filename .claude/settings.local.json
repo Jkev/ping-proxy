@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git pull *)",
+      "Bash(node -c server.js)",
+      "Bash(node -c scripts/clear-address-list-batch.js)",
+      "Bash(git add *)"
+    ]
+  }
+}

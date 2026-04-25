@@ -377,6 +377,66 @@ async function listActivePPPoESessions(routerIp) {
   }
 }
 
+// ==================== LIMPIAR ADDRESS-LIST DE FIREWALL ====================
+
+async function clearFirewallAddressList(routerIp, listName) {
+  console.log(`[FirewallAddressList] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+
+  if (!listName) {
+    return { success: false, message: 'Se requiere listName para limpiar address-list' };
+  }
+
+  const conn = new RouterOSAPI({
+    host: routerIp,
+    port: MIKROTIK_PORT,
+    user: MIKROTIK_USER,
+    password: MIKROTIK_PASSWORD,
+    timeout: 10,
+  });
+
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+    console.log(`[FirewallAddressList] Listando entradas de "${listName}"...`);
+
+    // Equivalente a: /ip firewall address-list print where list="morosos"
+    const entries = await conn.write('/ip/firewall/address-list/print', [
+      '?list=' + listName,
+    ]);
+
+    if (!entries || entries.length === 0) {
+      await conn.close();
+      console.log(`[FirewallAddressList] La lista "${listName}" no tiene entradas`);
+      return {
+        success: true,
+        message: `La lista "${listName}" no tiene entradas`,
+        removed: 0,
+      };
+    }
+
+    console.log(`[FirewallAddressList] Encontradas ${entries.length} entradas, removiendo...`);
+
+    // Equivalente a: /ip firewall address-list remove [find list="morosos"]
+    // RouterOS API acepta múltiples ids separados por coma en un solo remove
+    const ids = entries.map(e => e['.id']).join(',');
+    await conn.write('/ip/firewall/address-list/remove', [
+      '=.id=' + ids,
+    ]);
+
+    await conn.close();
+    console.log(`[FirewallAddressList] ✅ ${entries.length} entradas removidas de "${listName}"`);
+
+    return {
+      success: true,
+      message: `${entries.length} entradas removidas de address-list "${listName}"`,
+      removed: entries.length,
+      listName,
+    };
+  } catch (error) {
+    console.error('[FirewallAddressList] Error:', error.message);
+    return { success: false, message: error.message || 'Error limpiando address-list' };
+  }
+}
+
 // ==================== REBOOT ONT VÍA SMARTOLT (HUAWEI) ====================
 
 // Cache de OLTs: IP → olt_id
@@ -851,6 +911,44 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Limpiar address-list de firewall (ej: morosos)
+  if (req.method === 'POST' && req.url === '/firewall/address-list/clear') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { ipRouter, listName } = JSON.parse(body);
+
+        if (!ipRouter || !listName) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Faltan parámetros: ipRouter, listName'
+          }));
+          return;
+        }
+
+        console.log(`[Request] Limpiando address-list "${listName}" en ${ipRouter}`);
+        const result = await clearFirewallAddressList(ipRouter, listName);
+
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
   // Reboot ONT vía SmartOLT (Huawei)
   if (req.method === 'POST' && req.url === '/ont/reboot') {
     const authHeader = req.headers['authorization'];
@@ -903,6 +1001,7 @@ server.listen(PORT, () => {
   console.log(`   POST /ping            - Verificar estado PPPoE (requiere Authorization header)`);
   console.log(`   POST /ppp/disconnect  - Desconectar sesión PPPoE MikroTik (requiere Authorization header)`);
   console.log(`   POST /ont/reboot      - Reboot ONT vía SmartOLT Huawei (requiere Authorization header)`);
+  console.log(`   POST /firewall/address-list/clear - Limpiar address-list MikroTik (requiere Authorization header)`);
   console.log(`   POST /monitor/run     - Ejecutar monitoreo manual (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
