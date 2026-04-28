@@ -498,6 +498,132 @@ async function clearFirewallAddressListBatch(routers, listName, concurrency) {
   };
 }
 
+// ==================== REMOVE ADDRESS-LIST POR COMMENT ====================
+
+async function removeAddressListByComments(routerIp, comments) {
+  const list = Array.isArray(comments) ? comments.filter(Boolean) : (comments ? [comments] : []);
+  console.log(`[FirewallAddressListByComment] Conectando a router ${routerIp}:${MIKROTIK_PORT} (${list.length} comments)...`);
+
+  if (list.length === 0) {
+    return { success: false, message: 'Se requiere al menos un comment' };
+  }
+
+  const conn = new RouterOSAPI({
+    host: routerIp,
+    port: MIKROTIK_PORT,
+    user: MIKROTIK_USER,
+    password: MIKROTIK_PASSWORD,
+    timeout: 10,
+  });
+
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+
+    // Equivalente a: /ip firewall address-list print where comment="<c>"  (por cada comment)
+    const allEntries = [];
+    const perComment = {};
+    for (const c of list) {
+      const entries = await conn.write('/ip/firewall/address-list/print', ['?comment=' + c]);
+      perComment[c] = entries.length;
+      if (entries.length > 0) allEntries.push(...entries);
+    }
+
+    if (allEntries.length === 0) {
+      await conn.close();
+      console.log(`[FirewallAddressListByComment] ${routerIp}: ningún comment coincide`);
+      return {
+        success: true,
+        message: `Ningún comment coincide en ${routerIp}`,
+        removed: 0,
+        perComment,
+      };
+    }
+
+    console.log(`[FirewallAddressListByComment] ${routerIp}: ${allEntries.length} entradas, removiendo...`);
+
+    // Equivalente a: /ip firewall address-list remove [find comment="..."]
+    const ids = allEntries.map(e => e['.id']).join(',');
+    await conn.write('/ip/firewall/address-list/remove', ['=.id=' + ids]);
+
+    await conn.close();
+    console.log(`[FirewallAddressListByComment] ✅ ${routerIp}: ${allEntries.length} entradas removidas`);
+
+    return {
+      success: true,
+      message: `${allEntries.length} entradas removidas en ${routerIp}`,
+      removed: allEntries.length,
+      perComment,
+    };
+  } catch (error) {
+    console.error(`[FirewallAddressListByComment] ${routerIp} error:`, error.message);
+    try { await conn.close(); } catch (_) {}
+    return { success: false, message: error.message || 'Error removiendo por comment' };
+  }
+}
+
+async function removeAddressListByCommentsBatch(groups, concurrency) {
+  console.log(`[FirewallAddressListByCommentBatch] Iniciando: ${groups.length} routers, concurrencia=${concurrency}`);
+  const t0 = Date.now();
+  const results = new Array(groups.length);
+  let cursor = 0;
+  let processed = 0;
+
+  async function worker() {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= groups.length) return;
+      const { ipRouter, comments } = groups[idx];
+      const start = Date.now();
+      try {
+        const r = await removeAddressListByComments(ipRouter, comments);
+        const elapsed = Date.now() - start;
+        results[idx] = {
+          ipRouter,
+          commentsRequested: Array.isArray(comments) ? comments.length : 1,
+          success: r.success === true,
+          removed: r.removed || 0,
+          message: r.message,
+          perComment: r.perComment,
+          elapsed,
+        };
+      } catch (err) {
+        results[idx] = {
+          ipRouter,
+          commentsRequested: Array.isArray(comments) ? comments.length : 1,
+          success: false,
+          removed: 0,
+          message: err.message || 'Error desconocido',
+          elapsed: Date.now() - start,
+        };
+      }
+      processed++;
+      console.log(`[FirewallAddressListByCommentBatch] [${processed}/${groups.length}] ${ipRouter}: ${results[idx].success ? '✅' : '❌'} removed=${results[idx].removed} (${results[idx].elapsed}ms)`);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(concurrency, groups.length) }, () => worker());
+  await Promise.all(runners);
+
+  const ok = results.filter(r => r.success);
+  const failed = results.filter(r => !r.success);
+  const totalRemoved = ok.reduce((sum, r) => sum + (r.removed || 0), 0);
+  const totalElapsed = Date.now() - t0;
+
+  console.log(`[FirewallAddressListByCommentBatch] Completado en ${(totalElapsed / 1000).toFixed(1)}s — ${ok.length} ok, ${failed.length} fail, ${totalRemoved} entradas removidas`);
+
+  return {
+    success: true,
+    summary: {
+      total: results.length,
+      ok: ok.length,
+      failed: failed.length,
+      totalRemoved,
+      elapsedMs: totalElapsed,
+    },
+    results,
+  };
+}
+
 // ==================== REBOOT ONT VÍA SMARTOLT (HUAWEI) ====================
 
 // Cache de OLTs: IP → olt_id
@@ -1061,6 +1187,99 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Remove address-list por comment (un router, uno o varios comments)
+  if (req.method === 'POST' && req.url === '/firewall/address-list/remove-by-comment') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { ipRouter, comment, comments } = JSON.parse(body);
+        const list = Array.isArray(comments) ? comments : (comment ? [comment] : []);
+
+        if (!ipRouter || list.length === 0) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Faltan parámetros: ipRouter, comment (string) o comments (array)'
+          }));
+          return;
+        }
+
+        console.log(`[Request] Remove address-list por comment en ${ipRouter} (${list.length} comments)`);
+        const result = await removeAddressListByComments(ipRouter, list);
+
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Remove address-list por comment en batch (varios routers con sus comments)
+  if (req.method === 'POST' && req.url === '/firewall/address-list/remove-by-comment-batch') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const { groups, concurrency } = JSON.parse(body);
+
+        if (!Array.isArray(groups) || groups.length === 0) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Falta parámetro: groups (array no vacío de { ipRouter, comments[] })'
+          }));
+          return;
+        }
+
+        const valid = groups.every(g =>
+          g && typeof g.ipRouter === 'string' && g.ipRouter.length > 0 &&
+          Array.isArray(g.comments) && g.comments.length > 0 &&
+          g.comments.every(c => typeof c === 'string' && c.length > 0)
+        );
+        if (!valid) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Cada group debe tener { ipRouter: string, comments: string[] no vacío }'
+          }));
+          return;
+        }
+
+        const conc = Math.min(Math.max(parseInt(concurrency || 10, 10) || 10, 1), 20);
+        const totalComments = groups.reduce((s, g) => s + g.comments.length, 0);
+        console.log(`[Request] Batch remove address-list por comment: ${groups.length} routers, ${totalComments} comments (concurrencia=${conc})`);
+        const result = await removeAddressListByCommentsBatch(groups, conc);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno: ' + error.message }));
+      }
+    });
+    return;
+  }
+
   // Reboot ONT vía SmartOLT (Huawei)
   if (req.method === 'POST' && req.url === '/ont/reboot') {
     const authHeader = req.headers['authorization'];
@@ -1115,6 +1334,8 @@ server.listen(PORT, () => {
   console.log(`   POST /ont/reboot      - Reboot ONT vía SmartOLT Huawei (requiere Authorization header)`);
   console.log(`   POST /firewall/address-list/clear       - Limpiar address-list MikroTik (requiere Authorization header)`);
   console.log(`   POST /firewall/address-list/clear-batch - Limpiar address-list en varios routers (requiere Authorization header)`);
+  console.log(`   POST /firewall/address-list/remove-by-comment       - Remove entries por comment (requiere Authorization header)`);
+  console.log(`   POST /firewall/address-list/remove-by-comment-batch - Remove por comment en varios routers (requiere Authorization header)`);
   console.log(`   POST /monitor/run     - Ejecutar monitoreo manual (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
