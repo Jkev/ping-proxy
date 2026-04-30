@@ -195,8 +195,31 @@ function withTimeout(promise, ms, errorMsg = 'Timeout') {
   ]);
 }
 
-async function getClientStatus(routerIp, targetIp, pppUser = null) {
-  console.log(`[Status] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+// Construye la conexión al router. Si el caller pasa creds, las usa; sino fallback a globals.
+function buildRouterConn(routerIp, creds) {
+  return new RouterOSAPI({
+    host: routerIp,
+    port: (creds && creds.port) || MIKROTIK_PORT,
+    user: (creds && creds.user) || MIKROTIK_USER,
+    password: (creds && creds.password !== undefined) ? creds.password : MIKROTIK_PASSWORD,
+    timeout: 10,
+  });
+}
+
+function pickCreds(body) {
+  if (!body) return null;
+  const { mtUser, mtPassword, mtPort } = body;
+  if (!mtUser && !mtPassword && !mtPort) return null;
+  return {
+    user: mtUser || undefined,
+    password: mtPassword !== undefined ? mtPassword : undefined,
+    port: mtPort ? parseInt(mtPort, 10) : undefined,
+  };
+}
+
+async function getClientStatus(routerIp, targetIp, pppUser = null, creds = null) {
+  const port = (creds && creds.port) || MIKROTIK_PORT;
+  console.log(`[Status] Conectando a router ${routerIp}:${port}...`);
 
   // Si no hay pppUser, no podemos verificar el estado
   if (!pppUser) {
@@ -209,13 +232,7 @@ async function getClientStatus(routerIp, targetIp, pppUser = null) {
     };
   }
 
-  const conn = new RouterOSAPI({
-    host: routerIp,
-    port: MIKROTIK_PORT,
-    user: MIKROTIK_USER,
-    password: MIKROTIK_PASSWORD,
-    timeout: 10,
-  });
+  const conn = buildRouterConn(routerIp, creds);
 
   try {
     // Timeout de 15 segundos para la conexión
@@ -284,20 +301,15 @@ async function getClientStatus(routerIp, targetIp, pppUser = null) {
 
 // ==================== DESCONEXIÓN PPPoE ====================
 
-async function disconnectPPPoE(routerIp, pppUser) {
-  console.log(`[Disconnect] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+async function disconnectPPPoE(routerIp, pppUser, creds = null) {
+  const port = (creds && creds.port) || MIKROTIK_PORT;
+  console.log(`[Disconnect] Conectando a router ${routerIp}:${port}...`);
 
   if (!pppUser) {
     return { success: false, message: 'Se requiere pppUser para desconectar sesión' };
   }
 
-  const conn = new RouterOSAPI({
-    host: routerIp,
-    port: MIKROTIK_PORT,
-    user: MIKROTIK_USER,
-    password: MIKROTIK_PASSWORD,
-    timeout: 10,
-  });
+  const conn = buildRouterConn(routerIp, creds);
 
   try {
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
@@ -346,16 +358,11 @@ async function disconnectPPPoE(routerIp, pppUser) {
 
 // ==================== LISTAR SESIONES PPPoE ACTIVAS ====================
 
-async function listActivePPPoESessions(routerIp) {
-  console.log(`[PPPListActive] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+async function listActivePPPoESessions(routerIp, creds = null) {
+  const port = (creds && creds.port) || MIKROTIK_PORT;
+  console.log(`[PPPListActive] Conectando a router ${routerIp}:${port}...`);
 
-  const conn = new RouterOSAPI({
-    host: routerIp,
-    port: MIKROTIK_PORT,
-    user: MIKROTIK_USER,
-    password: MIKROTIK_PASSWORD,
-    timeout: 10,
-  });
+  const conn = buildRouterConn(routerIp, creds);
 
   try {
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
@@ -379,20 +386,15 @@ async function listActivePPPoESessions(routerIp) {
 
 // ==================== LIMPIAR ADDRESS-LIST DE FIREWALL ====================
 
-async function clearFirewallAddressList(routerIp, listName) {
-  console.log(`[FirewallAddressList] Conectando a router ${routerIp}:${MIKROTIK_PORT}...`);
+async function clearFirewallAddressList(routerIp, listName, creds = null) {
+  const port = (creds && creds.port) || MIKROTIK_PORT;
+  console.log(`[FirewallAddressList] Conectando a router ${routerIp}:${port}...`);
 
   if (!listName) {
     return { success: false, message: 'Se requiere listName para limpiar address-list' };
   }
 
-  const conn = new RouterOSAPI({
-    host: routerIp,
-    port: MIKROTIK_PORT,
-    user: MIKROTIK_USER,
-    password: MIKROTIK_PASSWORD,
-    timeout: 10,
-  });
+  const conn = buildRouterConn(routerIp, creds);
 
   try {
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
@@ -500,21 +502,16 @@ async function clearFirewallAddressListBatch(routers, listName, concurrency) {
 
 // ==================== REMOVE ADDRESS-LIST POR COMMENT ====================
 
-async function removeAddressListByComments(routerIp, comments) {
+async function removeAddressListByComments(routerIp, comments, creds = null) {
   const list = Array.isArray(comments) ? comments.filter(Boolean) : (comments ? [comments] : []);
-  console.log(`[FirewallAddressListByComment] Conectando a router ${routerIp}:${MIKROTIK_PORT} (${list.length} comments)...`);
+  const port = (creds && creds.port) || MIKROTIK_PORT;
+  console.log(`[FirewallAddressListByComment] Conectando a router ${routerIp}:${port} (${list.length} comments)...`);
 
   if (list.length === 0) {
     return { success: false, message: 'Se requiere al menos un comment' };
   }
 
-  const conn = new RouterOSAPI({
-    host: routerIp,
-    port: MIKROTIK_PORT,
-    user: MIKROTIK_USER,
-    password: MIKROTIK_PASSWORD,
-    timeout: 10,
-  });
+  const conn = buildRouterConn(routerIp, creds);
 
   try {
     await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
@@ -622,6 +619,53 @@ async function removeAddressListByCommentsBatch(groups, concurrency) {
     },
     results,
   };
+}
+
+// ==================== CREAR USER EN MIKROTIK ====================
+
+async function createMikrotikUser(routerIp, name, password, group, creds = null) {
+  const port = (creds && creds.port) || MIKROTIK_PORT;
+  console.log(`[CreateUser] Conectando a router ${routerIp}:${port}...`);
+
+  if (!name || !password || !group) {
+    return { success: false, message: 'Se requieren name, password y group' };
+  }
+
+  const conn = buildRouterConn(routerIp, creds);
+
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+
+    // Verificar si ya existe
+    const existing = await conn.write('/user/print', ['?name=' + name]);
+    if (existing && existing.length > 0) {
+      await conn.close();
+      console.log(`[CreateUser] El usuario "${name}" ya existe en ${routerIp}`);
+      return { success: false, message: `El usuario "${name}" ya existe`, alreadyExists: true };
+    }
+
+    // Crear usuario: /user add name=... password=... group=...
+    await conn.write('/user/add', [
+      '=name=' + name,
+      '=password=' + password,
+      '=group=' + group,
+    ]);
+
+    await conn.close();
+    console.log(`[CreateUser] ✅ Usuario "${name}" creado en ${routerIp}`);
+
+    return {
+      success: true,
+      message: `Usuario "${name}" creado en ${routerIp}`,
+      router: routerIp,
+      name,
+      group,
+    };
+  } catch (error) {
+    console.error('[CreateUser] Error:', error.message);
+    try { await conn.close(); } catch (_) {}
+    return { success: false, message: error.message || 'Error creando usuario' };
+  }
 }
 
 // ==================== REBOOT ONT VÍA SMARTOLT (HUAWEI) ====================
@@ -997,7 +1041,9 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       try {
-        const { ipRouter, clientIp, pppUser } = JSON.parse(body);
+        const parsed = JSON.parse(body);
+        const { ipRouter, clientIp, pppUser } = parsed;
+        const creds = pickCreds(parsed);
 
         if (!ipRouter || !clientIp) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1009,7 +1055,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         console.log(`[Request] Verificando estado de ${pppUser || clientIp} via ${ipRouter}`);
-        const result = await getClientStatus(ipRouter, clientIp, pppUser);
+        const result = await getClientStatus(ipRouter, clientIp, pppUser, creds);
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -1035,7 +1081,9 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       try {
-        const { ipRouter, pppUser } = JSON.parse(body);
+        const parsed = JSON.parse(body);
+        const { ipRouter, pppUser } = parsed;
+        const creds = pickCreds(parsed);
 
         if (!ipRouter || !pppUser) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1047,7 +1095,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         console.log(`[Request] Desconectando PPPoE ${pppUser} en ${ipRouter}`);
-        const result = await disconnectPPPoE(ipRouter, pppUser);
+        const result = await disconnectPPPoE(ipRouter, pppUser, creds);
 
         res.writeHead(result.success ? 200 : 404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -1073,7 +1121,9 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       try {
-        const { ipRouter } = JSON.parse(body);
+        const parsed = JSON.parse(body);
+        const { ipRouter } = parsed;
+        const creds = pickCreds(parsed);
 
         if (!ipRouter) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1085,7 +1135,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         console.log(`[Request] Listando sesiones PPPoE activas en ${ipRouter}`);
-        const result = await listActivePPPoESessions(ipRouter);
+        const result = await listActivePPPoESessions(ipRouter, creds);
 
         res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -1111,7 +1161,9 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       try {
-        const { ipRouter, listName } = JSON.parse(body);
+        const parsed = JSON.parse(body);
+        const { ipRouter, listName } = parsed;
+        const creds = pickCreds(parsed);
 
         if (!ipRouter || !listName) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1123,7 +1175,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         console.log(`[Request] Limpiando address-list "${listName}" en ${ipRouter}`);
-        const result = await clearFirewallAddressList(ipRouter, listName);
+        const result = await clearFirewallAddressList(ipRouter, listName, creds);
 
         res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -1200,8 +1252,10 @@ const server = http.createServer(async (req, res) => {
     req.on('data', chunk => { body += chunk; });
     req.on('end', async () => {
       try {
-        const { ipRouter, comment, comments } = JSON.parse(body);
+        const parsed = JSON.parse(body);
+        const { ipRouter, comment, comments } = parsed;
         const list = Array.isArray(comments) ? comments : (comment ? [comment] : []);
+        const creds = pickCreds(parsed);
 
         if (!ipRouter || list.length === 0) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1213,7 +1267,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         console.log(`[Request] Remove address-list por comment en ${ipRouter} (${list.length} comments)`);
-        const result = await removeAddressListByComments(ipRouter, list);
+        const result = await removeAddressListByComments(ipRouter, list, creds);
 
         res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
@@ -1308,6 +1362,46 @@ const server = http.createServer(async (req, res) => {
         const result = await rebootOnt(ipRouter, pppUser);
 
         res.writeHead(result.success ? 200 : 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Crear usuario en MikroTik (/user add)
+  if (req.method === 'POST' && req.url === '/user/create') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body);
+        const { ipRouter, name, password, group } = parsed;
+        const creds = pickCreds(parsed);
+
+        if (!ipRouter || !name || !password || !group) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            success: false,
+            message: 'Faltan parámetros: ipRouter, name, password, group'
+          }));
+          return;
+        }
+
+        console.log(`[Request] Crear user "${name}" group="${group}" en ${ipRouter}`);
+        const result = await createMikrotikUser(ipRouter, name, password, group, creds);
+
+        res.writeHead(result.success ? 200 : (result.alreadyExists ? 409 : 502), { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (error) {
         console.error('[Error]', error);
