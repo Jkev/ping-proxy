@@ -988,6 +988,126 @@ async function runMonitoringCycle() {
   console.log('========================================\n');
 }
 
+// ==================== CONFIG REMOTA DE MODEM (dst-nat) Y CAMBIO DE PASSWORD PPPoE ====================
+// Agregado para el módulo de Configuración/Activación de modems de MapaReportes.
+
+const MODEM_NAT_PORT_MIN = 20000;
+const MODEM_NAT_PORT_MAX = 20999;
+
+// Busca un puerto libre en el rango revisando los dst-nat existentes
+async function pickFreeNatPort(conn) {
+  const rules = await conn.write('/ip/firewall/nat/print', ['?chain=dstnat']);
+  const used = new Set((rules || []).map(r => parseInt(r['dst-port'], 10)).filter(Boolean));
+  for (let p = MODEM_NAT_PORT_MIN; p <= MODEM_NAT_PORT_MAX; p++) {
+    if (!used.has(p)) return p;
+  }
+  throw new Error('No hay puertos libres en el rango para dst-nat de modem');
+}
+
+function cleanPppUser(pppUser) {
+  return pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '');
+}
+
+// Crea (idempotente) un dst-nat: <router>:<dstPort> -> <ipModem>:<modemPort>.
+// La IP del modem se obtiene de la sesión PPPoE activa del pppUser.
+async function createModemNatRule(routerIp, pppUser, opts = {}, creds = null) {
+  if (!pppUser) return { success: false, message: 'Se requiere pppUser' };
+  const modemPort = parseInt(opts.modemPort || 80, 10);
+  const protocol = opts.protocol || 'tcp';
+  const publicHost = opts.publicHost || routerIp;
+  const conn = buildRouterConn(routerIp, creds);
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+    const user = cleanPppUser(pppUser);
+
+    const sessions = await conn.write('/ppp/active/print', ['?name=' + user]);
+    if (!sessions || sessions.length === 0) {
+      await conn.close();
+      return { success: false, message: `No hay sesión PPPoE activa para "${user}". El modem debe estar conectado (credenciales genéricas) antes de crear el NAT.` };
+    }
+    const modemIp = sessions[0].address;
+    const comment = `modem-config-${user}`;
+
+    const existing = await conn.write('/ip/firewall/nat/print', ['?comment=' + comment]);
+    if (existing && existing.length > 0) {
+      const rule = existing[0];
+      await conn.close();
+      const dstPort = parseInt(rule['dst-port'], 10);
+      return { success: true, alreadyExists: true, modemIp, dstPort, comment, link: `http://${publicHost}:${dstPort}`, message: `Regla dst-nat ya existía (${publicHost}:${dstPort} -> ${modemIp}:${modemPort})` };
+    }
+
+    const dstPort = opts.dstPort ? parseInt(opts.dstPort, 10) : await pickFreeNatPort(conn);
+    await conn.write('/ip/firewall/nat/add', [
+      '=chain=dstnat',
+      '=action=dst-nat',
+      '=protocol=' + protocol,
+      '=dst-port=' + dstPort,
+      '=to-addresses=' + modemIp,
+      '=to-ports=' + modemPort,
+      '=comment=' + comment,
+    ]);
+    await conn.close();
+    return { success: true, modemIp, dstPort, comment, link: `http://${publicHost}:${dstPort}`, message: `dst-nat creado: ${publicHost}:${dstPort} -> ${modemIp}:${modemPort}` };
+  } catch (e) {
+    try { await conn.close(); } catch (_) {}
+    return { success: false, message: e.message || 'Error creando dst-nat de modem' };
+  }
+}
+
+// Quita el/los dst-nat de config de modem (por comment) — limpieza/seguridad
+async function removeModemNatRule(routerIp, pppUser, creds = null) {
+  if (!pppUser) return { success: false, message: 'Se requiere pppUser' };
+  const conn = buildRouterConn(routerIp, creds);
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+    const comment = `modem-config-${cleanPppUser(pppUser)}`;
+    const rules = await conn.write('/ip/firewall/nat/print', ['?comment=' + comment]);
+    if (!rules || rules.length === 0) {
+      await conn.close();
+      return { success: true, removed: 0, message: 'No había regla para ese comment' };
+    }
+    const ids = rules.map(r => r['.id']).join(',');
+    await conn.write('/ip/firewall/nat/remove', ['=.id=' + ids]);
+    await conn.close();
+    return { success: true, removed: rules.length, comment, message: `${rules.length} regla(s) dst-nat removida(s)` };
+  } catch (e) {
+    try { await conn.close(); } catch (_) {}
+    return { success: false, message: e.message || 'Error removiendo dst-nat de modem' };
+  }
+}
+
+// Cambia el password del PPP secret <pppUser>. Por defecto desconecta la sesión
+// activa para forzar reconexión con la nueva contraseña.
+async function setPPPoEPassword(routerIp, pppUser, newPassword, opts = {}, creds = null) {
+  if (!pppUser || !newPassword) return { success: false, message: 'Se requieren pppUser y newPassword' };
+  const conn = buildRouterConn(routerIp, creds);
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+    const user = cleanPppUser(pppUser);
+    const secrets = await conn.write('/ppp/secret/print', ['?name=' + user]);
+    if (!secrets || secrets.length === 0) {
+      await conn.close();
+      return { success: false, message: `No existe PPP secret para "${user}"` };
+    }
+    const id = secrets[0]['.id'];
+    await conn.write('/ppp/secret/set', ['=.id=' + id, '=password=' + newPassword]);
+
+    let disconnected = false;
+    if (opts.disconnect !== false) {
+      const active = await conn.write('/ppp/active/print', ['?name=' + user]);
+      if (active && active.length > 0) {
+        await conn.write('/ppp/active/remove', ['=.id=' + active[0]['.id']]);
+        disconnected = true;
+      }
+    }
+    await conn.close();
+    return { success: true, disconnected, message: `Contraseña PPPoE de "${user}" actualizada${disconnected ? ' (sesión desconectada para reconectar)' : ''}` };
+  } catch (e) {
+    try { await conn.close(); } catch (_) {}
+    return { success: false, message: e.message || 'Error cambiando contraseña PPPoE' };
+  }
+}
+
 // ==================== SERVIDOR HTTP ====================
 
 const server = http.createServer(async (req, res) => {
@@ -1405,6 +1525,103 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify(result));
       } catch (error) {
         console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Crear dst-nat para config remota de modem
+  if (req.method === 'POST' && req.url === '/firewall/nat/create-modem') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body);
+        const { ipRouter, pppUser, dstPort, modemPort, protocol, publicHost } = parsed;
+        // El cliente de Digy manda apiPort cuando el router usa puerto API custom (ej. :9000).
+        let creds = pickCreds(parsed);
+        if (parsed.apiPort) creds = { ...(creds || {}), port: parseInt(parsed.apiPort, 10) };
+        if (!ipRouter || !pppUser) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: ipRouter, pppUser' })); return;
+        }
+        console.log(`[Request] Crear dst-nat modem para ${pppUser} en ${ipRouter}`);
+        const result = await createModemNatRule(ipRouter, pppUser, { dstPort, modemPort, protocol, publicHost }, creds);
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Quitar dst-nat de config de modem
+  if (req.method === 'POST' && req.url === '/firewall/nat/remove-modem') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body);
+        const { ipRouter, pppUser } = parsed;
+        let creds = pickCreds(parsed);
+        if (parsed.apiPort) creds = { ...(creds || {}), port: parseInt(parsed.apiPort, 10) };
+        if (!ipRouter || !pppUser) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: ipRouter, pppUser' })); return;
+        }
+        console.log(`[Request] Remover dst-nat modem para ${pppUser} en ${ipRouter}`);
+        const result = await removeModemNatRule(ipRouter, pppUser, creds);
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Cambiar contraseña PPPoE
+  if (req.method === 'POST' && req.url === '/ppp/set-password') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body);
+        const { ipRouter, pppUser, newPassword, disconnect } = parsed;
+        let creds = pickCreds(parsed);
+        if (parsed.apiPort) creds = { ...(creds || {}), port: parseInt(parsed.apiPort, 10) };
+        if (!ipRouter || !pppUser || !newPassword) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: ipRouter, pppUser, newPassword' })); return;
+        }
+        console.log(`[Request] Cambiar contraseña PPPoE de ${pppUser} en ${ipRouter}`);
+        const result = await setPPPoEPassword(ipRouter, pppUser, newPassword, { disconnect }, creds);
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, message: 'Error interno' }));
       }
