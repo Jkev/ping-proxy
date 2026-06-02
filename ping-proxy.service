@@ -1,0 +1,28 @@
+[Unit]
+Description=Ping Proxy - monitoreo PPPoE MikroTik (DIGY)
+Documentation=https://github.com/Jkev/ping-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pingproxy
+Group=pingproxy
+WorkingDirectory=/opt/ping-proxy
+ExecStart=/usr/bin/node /opt/ping-proxy/server.js
+Restart=on-failure
+RestartSec=5
+# Logs van al journal (journalctl -u ping-proxy)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ping-proxy
+Environment=NODE_ENV=production
+Environment=TZ=America/Mexico_City
+# Hardening basico
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

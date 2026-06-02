@@ -1,0 +1,19 @@
+[Unit]
+Description=ngrok tunnel para ping-proxy (3001 -> dominio reservado ngrok)
+After=network-online.target ping-proxy.service
+Wants=network-online.target
+Requires=ping-proxy.service
+
+[Service]
+Type=simple
+User=pingproxy
+Group=pingproxy
+ExecStart=/usr/local/bin/ngrok start ping-proxy --config /etc/ngrok/ngrok.yml --log=stdout --log-format=logfmt
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ngrok-ping-proxy
+
+[Install]
+WantedBy=multi-user.target

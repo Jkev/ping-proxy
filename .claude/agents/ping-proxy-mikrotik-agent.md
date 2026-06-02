@@ -16,7 +16,7 @@ Verificar el estado online/offline de clientes de DIGY (ISP México) consultando
 - **Node.js** (principal, `server.js`, 839 líneas) + **Python** (`server.py`, alternativa simple que SÍ usa ping ICMP)
 - Librerías: `routeros`, `node-cron`, `node-fetch`, `dotenv`
 - Puerto: **3001**
-- Desplegado en Windows + **Cloudflare Tunnel** → `ping.digy.mx`
+- Desplegado como servicio **systemd** en el Debian `portal.digy.mx` (migrado desde Windows el 2026-06-01). Para infra/despliegue/operación remota usa [[ping-proxy-debian-ops]].
 
 ## Archivos
 
@@ -103,9 +103,8 @@ El servicio **en producción es Node.js**. Python solo existe como plan B.
 
 ## Despliegue
 
-- Windows service (ver `SETUP.md`)
-- `cloudflared tunnel` expone `localhost:3001` como `ping.digy.mx`
-- Alternativa temporal: `ngrok http 3001`
+- **Producción (actual):** servicio `systemd` `ping-proxy` en el Debian `portal.digy.mx`, `/opt/ping-proxy`, puerto 3001 interno. Detalles en `SETUP-debian.md` y en [[ping-proxy-debian-ops]].
+- **Histórico:** corría en Windows + `cloudflared tunnel` como `ping.digy.mx` (ese DNS ya da NXDOMAIN). `SETUP.md` documenta ese montaje viejo.
 
 ## Cómo trabajar
 
