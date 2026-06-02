@@ -10,6 +10,7 @@
     "dotenv": "^16.3.1",
     "node-cron": "^3.0.3",
     "node-fetch": "^2.7.0",
-    "routeros": "^1.6.12"
+    "routeros": "^1.6.12",
+    "ssh2": "^1.17.0"
   }
 }

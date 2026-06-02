@@ -3,6 +3,7 @@ const http = require('http');
 const { RouterOSAPI } = require('routeros');
 const cron = require('node-cron');
 const fetch = require('node-fetch');
+const { oltAutoFind, oltOnuState, oltAuthorizeOnu } = require('./olt-vsol');
 
 // Configuración
 const PORT = 3001;
@@ -1629,6 +1630,106 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ==================== OLT V-SOL (autorización de ONUs por SSH CLI) ====================
+  // Las credenciales/host de la OLT vienen en el body (el panel las saca de su
+  // colección `olts` en Firestore). oltHost/oltUser/oltPass son obligatorios.
+
+  // Listar ONUs detectadas sin autorizar (auto-find)
+  if (req.method === 'POST' && req.url === '/olt/autofind') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const { oltHost, oltPort, oltUser, oltPass, enablePass, ponPorts, ponCount } = JSON.parse(body);
+        if (!oltHost || !oltUser || !oltPass) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass' })); return;
+        }
+        console.log(`[Request] OLT auto-find en ${oltHost}`);
+        const result = await oltAutoFind(
+          { host: oltHost, port: oltPort || 22, user: oltUser, pass: oltPass, enablePass, ponCount },
+          Array.isArray(ponPorts) ? ponPorts : null
+        );
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Estado de las ONUs de un puerto PON (verificación post-autorización)
+  if (req.method === 'POST' && req.url === '/olt/onu-state') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const { oltHost, oltPort, oltUser, oltPass, enablePass, ponPort } = JSON.parse(body);
+        if (!oltHost || !oltUser || !oltPass || !ponPort) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass, ponPort' })); return;
+        }
+        console.log(`[Request] OLT onu-state ${oltHost} pon 0/${ponPort}`);
+        const result = await oltOnuState(
+          { host: oltHost, port: oltPort || 22, user: oltUser, pass: oltPass, enablePass },
+          parseInt(ponPort, 10)
+        );
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Autorizar una ONU (idempotente por SN) con perfiles line/srv de la plaza
+  if (req.method === 'POST' && req.url === '/olt/authorize') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const { oltHost, oltPort, oltUser, oltPass, enablePass, ponPort, sn, desc, lineProfile, srvProfile, save } = JSON.parse(body);
+        if (!oltHost || !oltUser || !oltPass || !ponPort || !sn || !lineProfile || !srvProfile) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass, ponPort, sn, lineProfile, srvProfile' })); return;
+        }
+        console.log(`[Request] OLT authorize ${sn} en ${oltHost} pon 0/${ponPort}`);
+        const result = await oltAuthorizeOnu(
+          { host: oltHost, port: oltPort || 22, user: oltUser, pass: oltPass, enablePass },
+          { ponPort: parseInt(ponPort, 10), sn, desc, lineProfile, srvProfile, save: save !== false }
+        );
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
   // 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ message: 'Not found' }));
@@ -1648,6 +1749,9 @@ server.listen(PORT, () => {
   console.log(`   POST /firewall/address-list/remove-by-comment       - Remove entries por comment (requiere Authorization header)`);
   console.log(`   POST /firewall/address-list/remove-by-comment-batch - Remove por comment en varios routers (requiere Authorization header)`);
   console.log(`   POST /monitor/run     - Ejecutar monitoreo manual (requiere Authorization header)`);
+  console.log(`   POST /olt/autofind    - ONUs sin autorizar en OLT V-SOL (requiere Authorization header)`);
+  console.log(`   POST /olt/onu-state   - Estado de ONUs de un puerto PON (requiere Authorization header)`);
+  console.log(`   POST /olt/authorize   - Autorizar ONU en OLT V-SOL (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
 
