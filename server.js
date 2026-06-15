@@ -198,9 +198,14 @@ function withTimeout(promise, ms, errorMsg = 'Timeout') {
 
 // Construye la conexión al router. Si el caller pasa creds, las usa; sino fallback a globals.
 function buildRouterConn(routerIp, creds) {
+  // El ipRouter puede venir como "ip:puerto" (ej. routers públicos con la API
+  // forwardeada en un puerto no estándar). Separar host y puerto embebido.
+  let host = routerIp, embeddedPort;
+  const m = /^(.+):(\d+)$/.exec(String(routerIp));
+  if (m) { host = m[1]; embeddedPort = parseInt(m[2], 10); }
   return new RouterOSAPI({
-    host: routerIp,
-    port: (creds && creds.port) || MIKROTIK_PORT,
+    host,
+    port: (creds && creds.port) || embeddedPort || MIKROTIK_PORT,
     user: (creds && creds.user) || MIKROTIK_USER,
     password: (creds && creds.password !== undefined) ? creds.password : MIKROTIK_PASSWORD,
     timeout: 10,
