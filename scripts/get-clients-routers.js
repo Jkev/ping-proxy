@@ -65,6 +65,7 @@ async function pool(items, concurrency, worker) {
     const svc = Array.isArray(d.servicios) && d.servicios[0];
     return {
       idCliente: d.id,
+      idservicio: svc ? svc.id : null,
       nombreCliente: d.nombre,
       estado: d.estado,
       idRouter: svc ? svc.nodo : null,
@@ -88,6 +89,7 @@ async function pool(items, concurrency, worker) {
     const r = c.idRouter != null ? routerMap.get(c.idRouter) : null;
     return {
       idCliente: c.idCliente,
+      idservicio: c.idservicio ?? '',
       nombreCliente: c.nombreCliente || '',
       estado: c.estado || '',
       pppuser: c.pppuser || '',
@@ -101,7 +103,7 @@ async function pool(items, concurrency, worker) {
   fs.writeFileSync(OUT_JSON, JSON.stringify(final, null, 2));
 
   const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-  const header = ['idCliente','nombreCliente','estado','pppuser','idRouter','nombreRouter','ipRouter','error'];
+  const header = ['idCliente','idservicio','nombreCliente','estado','pppuser','idRouter','nombreRouter','ipRouter','error'];
   const csv = [header.join(',')]
     .concat(final.map(row => header.map(h => esc(row[h])).join(',')))
     .join('\n');

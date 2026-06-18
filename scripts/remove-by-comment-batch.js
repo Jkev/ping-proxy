@@ -26,7 +26,9 @@ function loadAndGroup() {
     process.exit(1);
   }
   const data = JSON.parse(fs.readFileSync(INPUT, 'utf8'));
-  const valid = data.filter(d => d.idCliente && d.ipRouter && !d.error);
+  // El address-list `morosos` del MikroTik se llavea por comment="Corte_Servicio_<idservicio>"
+  // (NO idCliente ni pppuser). Por eso exigimos y usamos idservicio.
+  const valid = data.filter(d => d.idservicio && d.ipRouter && !d.error);
 
   const byIp = new Map();
   for (const c of valid) {
@@ -34,9 +36,9 @@ function loadAndGroup() {
       byIp.set(c.ipRouter, { ipRouter: c.ipRouter, nombreRouter: c.nombreRouter || '', comments: [], clientes: [] });
     }
     const g = byIp.get(c.ipRouter);
-    const comment = `${COMMENT_PREFIX}${c.idCliente}`;
+    const comment = `${COMMENT_PREFIX}${c.idservicio}`;
     g.comments.push(comment);
-    g.clientes.push({ idCliente: c.idCliente, nombre: c.nombreCliente, comment });
+    g.clientes.push({ idCliente: c.idCliente, idservicio: c.idservicio, nombre: c.nombreCliente, comment });
   }
 
   return { groups: Array.from(byIp.values()), totalClientes: valid.length };
@@ -56,7 +58,7 @@ async function main() {
   console.log('========================================');
   console.log(`Proxy URL      : ${PROXY_URL}`);
   console.log(`Input          : ${INPUT}`);
-  console.log(`Comment prefix : "${COMMENT_PREFIX}"  (ej: ${COMMENT_PREFIX}<idCliente>)`);
+  console.log(`Comment prefix : "${COMMENT_PREFIX}"  (ej: ${COMMENT_PREFIX}<idservicio>)`);
   console.log(`Clientes       : ${totalClientes}`);
   console.log(`Routers        : ${groups.length}`);
   console.log(`Comments total : ${totalComments}`);
