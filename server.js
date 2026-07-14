@@ -1169,7 +1169,8 @@ const server = http.createServer(async (req, res) => {
       try {
         const parsed = JSON.parse(body);
         const { ipRouter, clientIp, pppUser } = parsed;
-        const creds = pickCreds(parsed);
+        let creds = pickCreds(parsed);
+        if (parsed.apiPort) creds = { ...(creds || {}), port: parseInt(parsed.apiPort, 10) };
 
         if (!ipRouter || !clientIp) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1209,7 +1210,8 @@ const server = http.createServer(async (req, res) => {
       try {
         const parsed = JSON.parse(body);
         const { ipRouter, pppUser } = parsed;
-        const creds = pickCreds(parsed);
+        let creds = pickCreds(parsed);
+        if (parsed.apiPort) creds = { ...(creds || {}), port: parseInt(parsed.apiPort, 10) };
 
         if (!ipRouter || !pppUser) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
