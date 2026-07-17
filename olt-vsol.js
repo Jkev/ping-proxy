@@ -44,6 +44,17 @@ const SSH_ALGORITHMS = {
 const PROMPT_RE = /[\w.\-]+(\([\w\-\/]+\))?[#>]\s*$/;
 const MORE_RE = /--More--|--\s*more\s*--|Press any key/i;
 
+// SINTAXIS VERIFICADA 2026-07-15 contra Mecapalapa (10.32.184.2) con el probe
+// read-only `scripts/olt-reboot-probe.js`: el onu-id va ANTES de `reboot`.
+//   - `onu <id> ?`      lista `reboot  Reboot onu.`
+//   - `onu reboot ?`    → "% There is no matched command" (el orden inverso NO existe)
+//   - `onu <id> reboot ?` → "<cr> Just Press Enter to Execute command!"
+// Se ejecuta dentro del contexto `interface gpon 0/<port>`. (Acepta opcionales
+// `delay`/`at`/`week_day`; sin ellos, reinicia de inmediato.)
+// Nota de seguridad: si la sintaxis fuera incorrecta, VsolCli.exec() lanza
+// "La OLT no reconoce el comando" en vez de ejecutar algo inesperado.
+const buildRebootCmd = (onuId) => `onu ${onuId} reboot`;
+
 /**
  * Limpia secuencias ANSI del output del CLI. La OLT alinea columnas con
  * "cursor forward" (ESC[NNC) — se convierte a espacios para poder parsear.
@@ -197,6 +208,72 @@ function parseOnuState(output) {
   return onus;
 }
 
+/** Normaliza un usuario PPPoE: quita el envoltorio `<pppoe-...>` de MikroTik. */
+function cleanPppoe(user) {
+  return String(user || '').replace(/^<?(pppoe-)?/, '').replace(/>$/, '').trim();
+}
+
+/**
+ * Parsea `show running-config` completo → una entrada por ONU con todo lo que
+ * necesitamos para ubicarla y cruzarla con MikroWisp:
+ *   [{ slot, port, onuId, sn, desc, pppoeUser, pppoePwd, mode }]
+ *
+ * El PPPoE del cliente SOLO aparece aquí (no en show onu info/state), y solo
+ * para ONUs provisionadas en modo router (con líneas `wan_adv ... pppoe`). Las
+ * ONUs en modo bridge quedan con `pppoeUser: null` y `mode: 'bridge'`.
+ *
+ * Estructura relevante del running-config (dentro de `interface gpon 0/<port>`):
+ *   onu add <id> profile default sn <SN>
+ *   onu <id> desc <Nombre>
+ *   onu <id> pri wan_adv index 1 route ipv4 pppoe ... user <USER> pwd <PWD> ...
+ */
+function parseRunningConfig(output) {
+  const byKey = new Map(); // `${port}:${onuId}` → registro
+  let curSlot = 0;
+  let curPort = null;
+  const clean = stripAnsi(output);
+
+  const ensure = (onuId) => {
+    const key = `${curPort}:${onuId}`;
+    let rec = byKey.get(key);
+    if (!rec) {
+      rec = { slot: curSlot, port: curPort, onuId, sn: null, desc: null, pppoeUser: null, pppoePwd: null, mode: 'bridge' };
+      byKey.set(key, rec);
+    }
+    return rec;
+  };
+
+  for (const raw of clean.split('\n')) {
+    const line = raw.trim();
+
+    const ctx = line.match(/^interface\s+gpon\s+(\d+)\/(\d+)/i);
+    if (ctx) { curSlot = parseInt(ctx[1], 10); curPort = parseInt(ctx[2], 10); continue; }
+    if (curPort == null) continue;
+
+    let m;
+    // onu add <id> profile default sn <SN>
+    if ((m = line.match(/^onu\s+add\s+(\d+)\b.*\bsn\s+([A-Za-z0-9]+)/i))) {
+      ensure(parseInt(m[1], 10)).sn = m[2];
+      continue;
+    }
+    // onu <id> desc <texto>
+    if ((m = line.match(/^onu\s+(\d+)\s+desc\s+(.+)$/i))) {
+      ensure(parseInt(m[1], 10)).desc = m[2].trim();
+      continue;
+    }
+    // onu <id> pri wan_adv ... pppoe ... user <USER> pwd <PWD>
+    if ((m = line.match(/^onu\s+(\d+)\s+pri\s+wan_adv\b.*\bpppoe\b.*\buser\s+(\S+)\s+pwd\s+(\S+)/i))) {
+      const rec = ensure(parseInt(m[1], 10));
+      rec.pppoeUser = m[2];
+      rec.pppoePwd = m[3];
+      rec.mode = 'router';
+      continue;
+    }
+  }
+
+  return Array.from(byKey.values()).sort((a, b) => a.port - b.port || a.onuId - b.onuId);
+}
+
 /** Nombre/desc seguro para el CLI: sin espacios ni caracteres raros. */
 function sanitizeDesc(desc) {
   return String(desc || '')
@@ -327,14 +404,129 @@ async function oltAuthorizeOnu(oltCfg, { ponPort, sn, desc, lineProfile, srvProf
   }
 }
 
+/**
+ * Lista TODAS las ONUs de la OLT con su PPPoE cruzable (una sesión SSH,
+ * un solo `show running-config`). Base para el match con MikroWisp y para
+ * poblar la UI / selección manual.
+ */
+async function oltListOnusFull(oltCfg) {
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const cfg = await cli.exec('show running-config', 45000);
+    cli.close();
+    return { success: true, onus: parseRunningConfig(cfg) };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error consultando running-config', onus: [] };
+  }
+}
+
+/**
+ * Ejecuta el reboot de una ONU concreta (contexto `interface gpon <slot>/<port>`).
+ * `slot` = tarjeta (0 en OLTs tipo caja; 1..N en chasis con varias tarjetas).
+ */
+async function rebootInSession(cli, slot, port, onuId) {
+  await cli.exec(`interface gpon ${slot}/${port}`);
+  const out = await cli.exec(buildRebootCmd(onuId), 20000);
+  let state = null;
+  try {
+    state = parseOnuState(await cli.exec('show onu state')).find(s => s.onuId === onuId) || null;
+  } catch (_) { /* la verificación es best-effort */ }
+  try { await cli.exec('exit'); } catch (_) {}
+  return { cliOutput: (out || '').trim().slice(0, 300), state };
+}
+
+/**
+ * Reinicia una ONU por (tarjeta, puerto, onu-id) directos. Modo usado por
+ * LoginOLT, que ya conoce la ubicación de la ONU listada.
+ * `slot`/tarjeta es opcional y default 0 (OLT tipo caja) por compatibilidad.
+ */
+async function oltRebootOnu(oltCfg, { slot = 0, port, onuId }) {
+  if (port == null || onuId == null) return { success: false, message: 'Faltan port y onuId' };
+  const s = parseInt(slot, 10) || 0;
+  const p = parseInt(port, 10);
+  const id = parseInt(onuId, 10);
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const { cliOutput, state } = await rebootInSession(cli, s, p, id);
+    cli.close();
+    return { success: true, slot: s, port: p, onuId: id, message: `Comando de reboot enviado a GPON${s}/${p}:${id}`, cliOutput, state };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error enviando reboot' };
+  }
+}
+
+/**
+ * Reinicia la ONU de un cliente cruzando su PPPoE de MikroWisp contra el
+ * running-config de la OLT. Modo usado por MapaReportes-Digy.
+ *
+ * - 1 coincidencia exacta → reinicia (en la misma sesión SSH).
+ * - 0 coincidencias → { needsSelection: true, candidates } (posible bridge o
+ *   usuario distinto). NO reinicia a ciegas.
+ * - >1 coincidencias → { ambiguous: true, candidates }.
+ */
+async function oltFindAndRebootByPppoe(oltCfg, pppUser) {
+  const target = cleanPppoe(pppUser).toLowerCase();
+  if (!target) return { success: false, message: 'Falta pppUser' };
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const cfg = await cli.exec('show running-config', 45000);
+    const onus = parseRunningConfig(cfg);
+    const matches = onus.filter(o => o.pppoeUser && o.pppoeUser.toLowerCase() === target);
+
+    if (matches.length === 0) {
+      cli.close();
+      // no exponemos el pwd en los candidatos
+      const candidates = onus.map(({ slot, port, onuId, sn, desc, pppoeUser, mode }) => ({ slot, port, onuId, sn, desc, pppoeUser, mode }));
+      return {
+        success: false,
+        needsSelection: true,
+        message: `No se encontró ninguna ONU con PPPoE "${target}" en la OLT. Puede estar en modo bridge (el PPPoE no es visible en la OLT) o el usuario difiere. Seleccione la ONU manualmente.`,
+        candidates,
+      };
+    }
+    if (matches.length > 1) {
+      cli.close();
+      const candidates = matches.map(({ slot, port, onuId, sn, desc, pppoeUser, mode }) => ({ slot, port, onuId, sn, desc, pppoeUser, mode }));
+      return { success: false, ambiguous: true, message: `Se encontraron ${matches.length} ONUs con el mismo PPPoE "${target}"`, candidates };
+    }
+
+    const t = matches[0];
+    const { cliOutput, state } = await rebootInSession(cli, t.slot, t.port, t.onuId);
+    cli.close();
+    return {
+      success: true,
+      matched: { slot: t.slot, port: t.port, onuId: t.onuId, sn: t.sn, desc: t.desc, pppoeUser: t.pppoeUser, mode: t.mode },
+      message: `Reboot enviado a "${target}" → GPON${t.slot}/${t.port}:${t.onuId}`,
+      cliOutput,
+      state,
+    };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error en reboot por PPPoE' };
+  }
+}
+
 module.exports = {
   VsolCli,
   stripAnsi,
   parseAutoFind,
   parseOnuInfo,
   parseOnuState,
+  parseRunningConfig,
+  cleanPppoe,
   sanitizeDesc,
   oltAutoFind,
   oltOnuState,
   oltAuthorizeOnu,
+  oltListOnusFull,
+  oltRebootOnu,
+  oltFindAndRebootByPppoe,
 };

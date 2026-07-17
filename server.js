@@ -3,7 +3,8 @@ const http = require('http');
 const { RouterOSAPI } = require('routeros');
 const cron = require('node-cron');
 const fetch = require('node-fetch');
-const { oltAutoFind, oltOnuState, oltAuthorizeOnu } = require('./olt-vsol');
+const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe } = require('./olt-vsol');
+const { ucmStatus, ucmReboot } = require('./ucm-ssh');
 
 // Configuración
 const PORT = 3001;
@@ -11,6 +12,13 @@ const API_KEY = process.env.PROXY_API_KEY || 'tu-api-key-secreta-aqui';
 const MIKROTIK_USER = process.env.MIKROTIK_USER || 'mario';
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || '';
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
+
+// UCM (Grandstream) — credenciales SSH ADMIN para la CLI de mantenimiento.
+// Se pueden pasar por request (ucmHost/ucmUser/ucmPass) o dejar estos defaults.
+const UCM_SSH_HOST = process.env.UCM_SSH_HOST || '';
+const UCM_SSH_PORT = parseInt(process.env.UCM_SSH_PORT || '22', 10);
+const UCM_SSH_USER = process.env.UCM_SSH_USER || 'admin';
+const UCM_SSH_PASS = process.env.UCM_SSH_PASS || '';
 
 // MapaReportesDigy API config (MIGRADO de SheetBest)
 const MAPA_API_URL = process.env.MAPA_REPORTES_API_URL || 'https://mapa-reportes-digy.vercel.app';
@@ -1737,6 +1745,157 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Listar TODAS las ONUs con su PPPoE cruzable (parseo de show running-config)
+  if (req.method === 'POST' && req.url === '/olt/onus-full') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const { oltHost, oltPort, oltUser, oltPass, enablePass } = JSON.parse(body);
+        if (!oltHost || !oltUser || !oltPass) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass' })); return;
+        }
+        console.log(`[Request] OLT onus-full en ${oltHost}`);
+        const result = await oltListOnusFull({ host: oltHost, port: oltPort || 22, user: oltUser, pass: oltPass, enablePass });
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Reiniciar una ONU V-SOL por SSH. Dos modos:
+  //   - Directo:  { ponPort, onuId, slot? }     (lo usa LoginOLT; slot/tarjeta default 0)
+  //   - Por PPPoE:{ pppUser }                  (lo usa MapaReportes; resuelve por running-config, incl. tarjeta)
+  if (req.method === 'POST' && req.url === '/olt/reboot') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const parsedBody = JSON.parse(body);
+        const { oltHost, oltPort, oltUser, oltPass, enablePass, pppUser, ponPort, onuId } = parsedBody;
+        // tarjeta/slot: acepta slot | tarjeta | ponSlot; default 0 (OLT tipo caja)
+        const slot = parseInt(parsedBody.slot ?? parsedBody.tarjeta ?? parsedBody.ponSlot ?? 0, 10) || 0;
+        if (!oltHost || !oltUser || !oltPass) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass' })); return;
+        }
+        const hasDirect = ponPort != null && onuId != null;
+        if (!hasDirect && !pppUser) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Se requiere { ponPort, onuId } o { pppUser }' })); return;
+        }
+        const oltCfg = { host: oltHost, port: oltPort || 22, user: oltUser, pass: oltPass, enablePass };
+        let result;
+        if (hasDirect) {
+          console.log(`[Request] OLT reboot directo ${oltHost} GPON${slot}/${ponPort}:${onuId}`);
+          result = await oltRebootOnu(oltCfg, { slot, port: ponPort, onuId });
+        } else {
+          console.log(`[Request] OLT reboot por PPPoE "${pppUser}" en ${oltHost}`);
+          result = await oltFindAndRebootByPppoe(oltCfg, pppUser);
+        }
+        // needsSelection/ambiguous => 409 (conflicto: no se pudo resolver a una sola ONU)
+        const status = result.success ? 200 : (result.needsSelection || result.ambiguous ? 409 : 502);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // ==================== UCM (Grandstream) por SSH ====================
+  // CLI de mantenimiento restringida (prompt UCM6500 >): solo status/reboot útiles.
+  // Creds ADMIN por request (ucmHost/ucmUser/ucmPass) o defaults del .env (UCM_SSH_*).
+
+  // Estado del UCM (READ-ONLY): versiones, memoria, uptime, red.
+  if (req.method === 'POST' && req.url === '/ucm/status') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const parsed = body ? JSON.parse(body) : {};
+        const cfg = {
+          host: parsed.ucmHost || UCM_SSH_HOST,
+          port: parsed.ucmPort || UCM_SSH_PORT,
+          user: parsed.ucmUser || UCM_SSH_USER,
+          pass: parsed.ucmPass !== undefined ? parsed.ucmPass : UCM_SSH_PASS,
+        };
+        if (!cfg.host || !cfg.user || !cfg.pass) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan credenciales del UCM (ucmHost/ucmUser/ucmPass o UCM_SSH_* en .env)' })); return;
+        }
+        console.log(`[Request] UCM status ${cfg.host}`);
+        const result = await ucmStatus(cfg);
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // Reboot del UCM (⚠️ DESTRUCTIVO: interrumpe el servicio telefónico).
+  if (req.method === 'POST' && req.url === '/ucm/reboot') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const parsed = body ? JSON.parse(body) : {};
+        const cfg = {
+          host: parsed.ucmHost || UCM_SSH_HOST,
+          port: parsed.ucmPort || UCM_SSH_PORT,
+          user: parsed.ucmUser || UCM_SSH_USER,
+          pass: parsed.ucmPass !== undefined ? parsed.ucmPass : UCM_SSH_PASS,
+        };
+        if (!cfg.host || !cfg.user || !cfg.pass) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan credenciales del UCM (ucmHost/ucmUser/ucmPass o UCM_SSH_* en .env)' })); return;
+        }
+        console.log(`[Request] ⚠️ UCM REBOOT ${cfg.host}`);
+        const result = await ucmReboot(cfg);
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
   // 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ message: 'Not found' }));
@@ -1759,6 +1918,10 @@ server.listen(PORT, () => {
   console.log(`   POST /olt/autofind    - ONUs sin autorizar en OLT V-SOL (requiere Authorization header)`);
   console.log(`   POST /olt/onu-state   - Estado de ONUs de un puerto PON (requiere Authorization header)`);
   console.log(`   POST /olt/authorize   - Autorizar ONU en OLT V-SOL (requiere Authorization header)`);
+  console.log(`   POST /olt/onus-full   - Listar ONUs con PPPoE (running-config) en OLT V-SOL (requiere Authorization header)`);
+  console.log(`   POST /olt/reboot      - Reboot ONU V-SOL por SSH: {ponPort,onuId,slot?} o {pppUser} (requiere Authorization header)`);
+  console.log(`   POST /ucm/status      - Estado del UCM Grandstream por SSH (read-only) (requiere Authorization header)`);
+  console.log(`   POST /ucm/reboot      - ⚠️ Reboot del UCM Grandstream por SSH (requiere Authorization header)`);
   console.log(`\n📊 Modo: Verificación de sesión PPPoE (sin ping ICMP)`);
   console.log(`⏰ Cron job de monitoreo: cada hora`);
 
