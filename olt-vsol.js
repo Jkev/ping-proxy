@@ -528,7 +528,12 @@ async function oltOnuState(oltCfg, ponPort) {
     let state = [];
     let esperados = null;
     let parcial = false;
-    for (let intento = 1; intento <= 3; intento++) {
+    // 5 intentos: hay OLTs que se atoran seguido (Camotipán falla 3 seguidos con
+    // frecuencia). Entre intentos se le da un respiro corto — insistir de
+    // inmediato sobre una OLT que acaba de ahogarse tiende a fallar otra vez.
+    const INTENTOS = 5;
+    for (let intento = 1; intento <= INTENTOS; intento++) {
+      if (intento > 1) await new Promise(r => setTimeout(r, 400));
       const out = await cli.exec('show onu state', 20000);
       const leidas = parseOnuState(out);
       const total = totalDeclarado(out);
@@ -538,10 +543,10 @@ async function oltOnuState(oltCfg, ponPort) {
       // error — es justo el caso malo.
       if (total != null && leidas.length >= total) { parcial = false; break; }
       parcial = true;
-      if (intento < 3) console.warn(`[olt] ${oltCfg.host} pon ${ponPort}: volcado cortado (${leidas.length}/${total ?? 'sin pie'}), reintento ${intento + 1}/3`);
+      if (intento < INTENTOS) console.warn(`[olt] ${oltCfg.host} pon ${ponPort}: volcado cortado (${leidas.length}/${total ?? 'sin pie'}), reintento ${intento + 1}/${INTENTOS}`);
     }
     if (parcial) {
-      console.warn(`[olt] ${oltCfg.host} pon ${ponPort}: sigue incompleta tras 3 intentos (${state.length}/${esperados})`);
+      console.warn(`[olt] ${oltCfg.host} pon ${ponPort}: sigue incompleta tras ${INTENTOS} intentos (${state.length}/${esperados})`);
     }
     // `show onu info` (modelo) no existe en todos los firmwares (ej. chasis Díaz Mirón) → best-effort.
     let info = [];
