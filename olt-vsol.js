@@ -327,6 +327,32 @@ function parseOnuInfo(output) {
 }
 
 /** Parsea "show onu state": [{ onuId, adminState, omccState, phase, sn }] */
+/**
+ * Total de ONUs que la propia OLT declara al pie de `show onu state`.
+ *
+ * Sirve de checksum: si lo parseado no llega a ese total, el volcado vino
+ * cortado. Pasa de verdad — la OLT se atora a media lista y vuelve al prompt
+ * sola (medido en Reyixtla: ~25% de las lecturas, y las cortadas tardan 2.4s
+ * contra 0.96s de una completa). Nada del cliente escribe durante el volcado,
+ * así que no hay forma de evitarlo desde aquí: solo detectarlo y reintentar.
+ *
+ * Los tres dialectos lo imprimen distinto:
+ *   V1.4.5R  "pon: 1 total: 2 working: 2"
+ *   V2.x     "ONU Number: 46/53"
+ *   chasis   "total-3,  logging-0,  syncMib-0,  working-3, ..."
+ * Devuelve null si no se reconoce ninguno (entonces no hay checksum).
+ */
+function totalDeclarado(output) {
+  const txt = String(output || '');
+  let m = txt.match(/ONU\s+Number:\s*\d+\s*\/\s*(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  m = txt.match(/\bpon:\s*\d+\s+total:\s*(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  m = txt.match(/\btotal-(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+
 function parseOnuState(output) {
   const onus = [];
   for (const line of output.split('\n')) {
@@ -496,7 +522,27 @@ async function oltOnuState(oltCfg, ponPort) {
       cli.close();
       return { success: true, onus: state.map(s => ({ ...s, model: null })) };
     }
-    const state = parseOnuState(await cli.exec('show onu state'));
+    // Lectura con checksum: la OLT declara cuántas ONUs hay al pie. Si el
+    // volcado vino cortado se reintenta; sin esto el panel muestra media lista
+    // como si fuera la lista entera (y una ONU ausente se lee como "no existe").
+    let state = [];
+    let esperados = null;
+    let parcial = false;
+    for (let intento = 1; intento <= 3; intento++) {
+      const out = await cli.exec('show onu state', 20000);
+      const leidas = parseOnuState(out);
+      const total = totalDeclarado(out);
+      if (leidas.length > state.length) { state = leidas; esperados = total; }
+      // El pie solo se imprime cuando el volcado terminó: su AUSENCIA ya
+      // significa que vino cortado. Tratar `null` como "sin checksum" era el
+      // error — es justo el caso malo.
+      if (total != null && leidas.length >= total) { parcial = false; break; }
+      parcial = true;
+      if (intento < 3) console.warn(`[olt] ${oltCfg.host} pon ${ponPort}: volcado cortado (${leidas.length}/${total ?? 'sin pie'}), reintento ${intento + 1}/3`);
+    }
+    if (parcial) {
+      console.warn(`[olt] ${oltCfg.host} pon ${ponPort}: sigue incompleta tras 3 intentos (${state.length}/${esperados})`);
+    }
     // `show onu info` (modelo) no existe en todos los firmwares (ej. chasis Díaz Mirón) → best-effort.
     let info = [];
     try { info = parseOnuInfo(await cli.exec('show onu info')); } catch (_) { /* sin modelo */ }
@@ -505,6 +551,11 @@ async function oltOnuState(oltCfg, ponPort) {
     return {
       success: true,
       onus: state.map(s => ({ ...s, model: byId.get(s.onuId)?.model || null })),
+      // Se informan para que quien consuma pueda distinguir "el puerto tiene 27
+      // ONUs" de "solo alcanzamos a leer 27 de 79". Campos extra: los clientes
+      // viejos los ignoran.
+      ...(esperados != null ? { esperados } : {}),
+      ...(parcial ? { parcial: true } : {}),
     };
   } catch (e) {
     cli.close();
@@ -731,6 +782,7 @@ module.exports = {
   parseAutoFind,
   parseOnuInfo,
   parseOnuState,
+  totalDeclarado,
   parseRunningConfig,
   cleanPppoe,
   sanitizeDesc,
