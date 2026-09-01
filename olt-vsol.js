@@ -80,6 +80,18 @@ function stripAnsi(text) {
     .replace(/\r/g, '');
 }
 
+/**
+ * Quita las lineas de eventos asincronos que algunos firmwares vuelcan a la consola
+ * (ONU Online/Offline, logs con timestamp). Rompen la deteccion del prompt cuando
+ * llegan justo mientras se espera: el prompt deja de ser lo ultimo del buffer.
+ * Solo afecta a la deteccion; el output que se resuelve sigue completo.
+ */
+function stripAsyncEvents(text) {
+  return String(text).split('\n')
+    .filter(l => !/ONU\s+(Online|Offline)|^\s*\[?\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}/.test(l))
+    .join('\n');
+}
+
 class VsolCli {
   constructor({ host, port, user, pass, enablePass, transport = 'ssh' }) {
     this.transport = transport === 'telnet' ? 'telnet' : 'ssh';
@@ -184,9 +196,7 @@ class VsolCli {
         // consola (ONU Online/Offline, logs con timestamp) y que rompen la detección
         // del prompt si llegan justo mientras esperamos. Solo afecta a la detección;
         // el output que se resuelve sigue completo.
-        const filtered = clean.split('\n')
-          .filter(l => !/ONU\s+(Online|Offline)|^\s*\[?\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}/.test(l))
-          .join('\n');
+        const filtered = stripAsyncEvents(clean);
         const tail = filtered.slice(-300).trimEnd();
         if (MORE_RE.test(tail)) {
           this.stream.write(' '); // avanzar paginación
@@ -236,7 +246,9 @@ class VsolCli {
       let sentUser = false;
       let sentPass = false;
       const tick = () => {
-        const tail = stripAnsi(this.buffer).slice(-200).trimEnd();
+        // Mismo filtro que waitFor: una OLT con una ONU flapeando vuelca eventos
+        // detras del prompt y el login se quedaba esperando para siempre (Tamiahua).
+        const tail = stripAsyncEvents(stripAnsi(this.buffer)).slice(-200).trimEnd();
         const low = tail.toLowerCase();
         if (/[#>]\s*$/.test(tail)) return resolve();
         if (/(login incorrect|authentication failed|access denied|permission denied)/i.test(low)) {
@@ -404,7 +416,7 @@ function parseRunningConfig(output) {
   for (const raw of clean.split('\n')) {
     const line = raw.trim();
 
-    const ctx = line.match(/^interface\s+gpon\s+(\d+)\/(\d+)/i);
+    const ctx = line.match(/^interface\s+[ge]pon\s+(\d+)\/(\d+)/i);
     if (ctx) { curSlot = parseInt(ctx[1], 10); curPort = parseInt(ctx[2], 10); continue; }
     if (curPort == null) continue;
 
@@ -415,13 +427,15 @@ function parseRunningConfig(output) {
       continue;
     }
     // onu <id> desc <texto>
-    if ((m = line.match(/^onu\s+(\d+)\s+desc\s+(.+)$/i))) {
+    if ((m = line.match(/^onu\s+(\d+)\s+desc(?:ription)?\s+(.+)$/i))) {
       ensure(parseInt(m[1], 10)).desc = m[2].trim();
       continue;
     }
     // onu <id> pri wan_adv ... pppoe ... user <USER> pwd <PWD>
-    if ((m = line.match(/^onu\s+(\d+)\s+pri\s+wan_adv\b.*\bpppoe\b.*\buser\s+(\S+)\s+pwd\s+(\S+)/i))) {
+    if ((m = line.match(/^onu\s+(\d+)\s+pri\s+wan_(?:adv|conn)\b.*\bpppoe\b.*\buser\s+(\S+)\s+pwd\s+(\S+)/i))) {
       const rec = ensure(parseInt(m[1], 10));
+      // no pisar un PPPoE ya leido: en EPON hay varias lineas wan_conn por ONU
+      if (rec.pppoeUser) continue;
       rec.pppoeUser = m[2];
       rec.pppoePwd = m[3];
       rec.mode = 'router';
