@@ -19,6 +19,7 @@
  */
 
 const { Client } = require('ssh2');
+const net = require('net');
 
 const SSH_ALGORITHMS = {
   kex: [
@@ -55,6 +56,19 @@ const MORE_RE = /--More--|--\s*more\s*--|Press any key/i;
 // "La OLT no reconoce el comando" en vez de ejecutar algo inesperado.
 const buildRebootCmd = (onuId) => `onu ${onuId} reboot`;
 
+// --- Dialecto por tecnología de PON ---
+// GPON (V-SOL V1.4.5R / V2.x): contexto `interface gpon`, estado `show onu state`,
+//   reinicio `onu <id> reboot`.
+// EPON (V-SOL EPON, ej. Bejucal): contexto `interface epon`, estado `show onu status`
+//   (dentro del puerto), reinicio `reset onu <id>` (verificado read-only 2026-08-28).
+const isEpon = (tec) => String(tec || '').toLowerCase() === 'epon';
+const interfaceKw = (tec) => (isEpon(tec) ? 'epon' : 'gpon');
+const stateCmd = (tec) => (isEpon(tec) ? 'show onu status' : 'show onu state');
+// EPON: reinicio por ONU vía CTC OAM (`onu <id> ctc reset`, verificado <cr> 2026-08-28).
+// OJO: `reset onu auth/unauth` y `deregister onu auth/unauth` son operaciones MASIVAS
+// (de-autentican todo el puerto) — NO se usan para reiniciar una sola ONU.
+const buildRebootCmdFor = (tec, onuId) => (isEpon(tec) ? `onu ${onuId} ctc reset` : `onu ${onuId} reboot`);
+
 /**
  * Limpia secuencias ANSI del output del CLI. La OLT alinea columnas con
  * "cursor forward" (ESC[NNC) — se convierte a espacios para poder parsear.
@@ -67,9 +81,10 @@ function stripAnsi(text) {
 }
 
 class VsolCli {
-  constructor({ host, port = 22, user, pass, enablePass }) {
+  constructor({ host, port, user, pass, enablePass, transport = 'ssh' }) {
+    this.transport = transport === 'telnet' ? 'telnet' : 'ssh';
     this.host = host;
-    this.port = port;
+    this.port = port || (this.transport === 'telnet' ? 23 : 22);
     this.user = user;
     this.pass = pass;
     this.enablePass = enablePass || pass;
@@ -79,6 +94,12 @@ class VsolCli {
   }
 
   connect(timeoutMs = 15000) {
+    return this.transport === 'telnet'
+      ? this._connectTelnet(timeoutMs)
+      : this._connectSsh(timeoutMs);
+  }
+
+  _connectSsh(timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
       const conn = new Client();
       this.conn = conn;
@@ -105,13 +126,68 @@ class VsolCli {
     });
   }
 
+  /**
+   * Transporte Telnet crudo (OLTs viejas sin SSH, ej. Bejucal). Un net.Socket con
+   * negociación mínima IAC: rechaza todas las opciones (WONT/DONT) y limpia los
+   * bytes de control antes de acumular en el buffer. El login por usuario/clave lo
+   * hace después _interactiveLogin(), igual que en SSH con login interactivo.
+   */
+  _connectTelnet(timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      const socket = new net.Socket();
+      this.conn = socket;
+      let settled = false;
+      const done = (fn, arg) => { if (!settled) { settled = true; fn(arg); } };
+      socket.setTimeout(timeoutMs);
+      socket.on('timeout', () => { socket.destroy(); done(reject, new Error(`Telnet ${this.host}:${this.port} → timeout de conexión`)); });
+      socket.on('error', (err) => done(reject, new Error(`Telnet ${this.host}:${this.port} → ${err.message}`)));
+      socket.on('data', (buf) => {
+        const clean = this._telnetStrip(buf, socket);
+        if (clean.length) this.buffer += clean.toString('utf8');
+      });
+      socket.connect(this.port, this.host, () => {
+        socket.setTimeout(0);
+        this.stream = { write: (s) => socket.write(s) };
+        done(resolve);
+      });
+    });
+  }
+
+  /** Procesa secuencias IAC de Telnet: rechaza toda opción y devuelve el texto limpio. */
+  _telnetStrip(buf, socket) {
+    const IAC = 255, DONT = 254, DO = 253, WONT = 252, WILL = 251, SB = 250, SE = 240;
+    const out = [];
+    const resp = [];
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] === IAC) {
+        const cmd = buf[i + 1];
+        if (cmd === DO) { resp.push(IAC, WONT, buf[i + 2]); i += 2; }
+        else if (cmd === WILL) { resp.push(IAC, DONT, buf[i + 2]); i += 2; }
+        else if (cmd === DONT || cmd === WONT) { i += 2; }
+        else if (cmd === SB) { i += 2; while (i < buf.length && !(buf[i] === IAC && buf[i + 1] === SE)) i++; i += 1; }
+        else { i += 1; }
+      } else {
+        out.push(buf[i]);
+      }
+    }
+    if (resp.length) { try { socket.write(Buffer.from(resp)); } catch (_) {} }
+    return Buffer.from(out);
+  }
+
   /** Espera hasta que el buffer termine en prompt (o en un patrón dado). */
   waitFor(re = PROMPT_RE, timeoutMs = 12000) {
     return new Promise((resolve, reject) => {
       const started = Date.now();
       const tick = () => {
         const clean = stripAnsi(this.buffer);
-        const tail = clean.slice(-300).trimEnd();
+        // Quitar líneas de eventos asíncronos que algunos firmwares vuelcan a la
+        // consola (ONU Online/Offline, logs con timestamp) y que rompen la detección
+        // del prompt si llegan justo mientras esperamos. Solo afecta a la detección;
+        // el output que se resuelve sigue completo.
+        const filtered = clean.split('\n')
+          .filter(l => !/ONU\s+(Online|Offline)|^\s*\[?\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}:\d{2}/.test(l))
+          .join('\n');
+        const tail = filtered.slice(-300).trimEnd();
         if (MORE_RE.test(tail)) {
           this.stream.write(' '); // avanzar paginación
         } else if (re.test(tail)) {
@@ -141,9 +217,50 @@ class VsolCli {
     return body;
   }
 
-  /** Login completo: espera banner, entra a enable y config terminal. */
+  /** Ejecuta un comando ignorando si la OLT no lo reconoce (best-effort). */
+  async _execSafe(cmd, timeoutMs = 6000) {
+    try { return await this.exec(cmd, timeoutMs); } catch (_) { return ''; }
+  }
+
+  /**
+   * Login interactivo por prompts (usuario/clave). Cubre:
+   *   - Telnet (Bejucal): el servicio pide "Login:" y "Password:".
+   *   - SSH con login de aplicación (Pantepec V2.x): tras la auth SSH la OLT
+   *     vuelve a pedir "Login:"/"Password:" en texto.
+   *   - V-SOL clásico (Mecapalapa/Otlazintla): entra directo a "[#>]" y aquí
+   *     simplemente resuelve sin escribir nada.
+   */
+  _interactiveLogin(timeoutMs = 18000) {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      let sentUser = false;
+      let sentPass = false;
+      const tick = () => {
+        const tail = stripAnsi(this.buffer).slice(-200).trimEnd();
+        const low = tail.toLowerCase();
+        if (/[#>]\s*$/.test(tail)) return resolve();
+        if (/(login incorrect|authentication failed|access denied|permission denied)/i.test(low)) {
+          return reject(new Error('La OLT rechazó el usuario o la contraseña'));
+        }
+        if (!sentUser && /(login|username)\s*:\s*$/i.test(low)) {
+          this.buffer = ''; sentUser = true; this.stream.write(this.user + '\n');
+        } else if (sentUser && !sentPass && /password\s*:\s*$/i.test(low)) {
+          this.buffer = ''; sentPass = true; this.stream.write(this.pass + '\n');
+        }
+        if (Date.now() - started > timeoutMs) {
+          return reject(new Error(`Timeout en el login de la OLT (último: "${tail.slice(-100)}")`));
+        }
+        setTimeout(tick, 150);
+      };
+      tick();
+    });
+  }
+
+  /** Login completo: login interactivo (si aplica), enable y config terminal. */
   async login() {
-    await this.waitFor(/[#>]\s*$/, 15000);
+    await this._interactiveLogin();
+    // Quitar paginación para firmwares que la traen activa (ignora si no existe el comando).
+    await this._execSafe('terminal length 0');
     this.buffer = '';
     this.stream.write('enable\n');
     // puede pedir Password: o pasar directo a '#'
@@ -157,8 +274,14 @@ class VsolCli {
   }
 
   close() {
-    try { if (this.stream) this.stream.end('exit\n'); } catch (_) {}
-    try { if (this.conn) this.conn.end(); } catch (_) {}
+    try {
+      if (this.transport === 'telnet') {
+        if (this.conn) this.conn.destroy();
+      } else {
+        if (this.stream) this.stream.end('exit\n');
+        if (this.conn) this.conn.end();
+      }
+    } catch (_) {}
   }
 }
 
@@ -195,14 +318,49 @@ function parseOnuInfo(output) {
 function parseOnuState(output) {
   const onus = [];
   for (const line of output.split('\n')) {
-    const m = line.match(/GPON\d+\/\d+:(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/i);
+    // Formato V1.4.5R (Mecapalapa/Otlazintla): "GPON0/1:1  enable enable working <sn>"
+    let m = line.match(/[GE]PON\d+\/\d+:(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/i);
+    if (m) {
+      onus.push({ onuId: parseInt(m[1], 10), adminState: m[2], omccState: m[3], phase: m[4], sn: m[5] });
+      continue;
+    }
+    // Formato V2.x (Pantepec): OnuIndex "marco/tarjeta/puerto:onu" y columna Channel en vez de SN.
+    //   "1/1/1:1   enable   enable   working   1(GPON)"
+    m = line.match(/^\s*\d+\/\d+\/\d+:(\d+)\s+(enable|disable)\s+(\S+)\s+(\S+)/i);
+    if (m) {
+      onus.push({ onuId: parseInt(m[1], 10), adminState: m[2], omccState: m[3], phase: m[4], sn: null });
+      continue;
+    }
+    // Formato chasis (Díaz Mirón, CBG1601): ONU-Index es un número pelón dentro del puerto.
+    //   "1   enable   enable   working   HWTC12345678"
+    m = line.match(/^\s*(\d+)\s+(enable|disable)\s+(enable|disable)\s+(\S+)\s*([A-Za-z]{4}[0-9a-fA-F]{8})?/);
+    if (m) {
+      onus.push({ onuId: parseInt(m[1], 10), adminState: m[2], omccState: m[3], phase: m[4], sn: m[5] || null });
+      continue;
+    }
+  }
+  return onus;
+}
+
+/**
+ * Estado de ONUs en OLTs EPON (`show onu status` dentro de `interface epon`):
+ *   ONU-ID     Status    MAC Address        Distance ...
+ *   EPON0/1:1  offline   c4:70:0b:3a:39:50  ...
+ * Normaliza phase: online -> "working", offline -> "offline" (para reusar la
+ * lógica de "working" del resto del código). El SN no lo lista (trae MAC).
+ */
+function parseOnuStateEpon(output) {
+  const onus = [];
+  for (const line of output.split('\n')) {
+    const m = line.match(/EPON\d+\/\d+:(\d+)\s+(online|offline)\s+([0-9a-fA-F:]{17})?/);
     if (!m) continue;
     onus.push({
       onuId: parseInt(m[1], 10),
-      adminState: m[2],
-      omccState: m[3],
-      phase: m[4],
-      sn: m[5],
+      adminState: 'enable',
+      omccState: m[2] === 'online' ? 'enable' : 'disable',
+      phase: m[2] === 'online' ? 'working' : 'offline',
+      sn: null,
+      mac: m[3] || null,
     });
   }
   return onus;
@@ -313,12 +471,21 @@ async function oltAutoFind(oltCfg, ponPorts = null) {
 /** Estado de las ONUs de un puerto (para verificar tras autorizar). */
 async function oltOnuState(oltCfg, ponPort) {
   const cli = new VsolCli(oltCfg);
+  const tec = oltCfg.tec;
+  const slot = parseInt(oltCfg.slot, 10) || 0; // 0 en OLTs tipo caja; >0 en chasis (ej. Díaz Mirón slot 2)
   try {
     await cli.connect();
     await cli.login();
-    await cli.exec(`interface gpon 0/${ponPort}`);
+    await cli.exec(`interface ${interfaceKw(tec)} ${slot}/${ponPort}`);
+    if (isEpon(tec)) {
+      const state = parseOnuStateEpon(await cli.exec('show onu status'));
+      cli.close();
+      return { success: true, onus: state.map(s => ({ ...s, model: null })) };
+    }
     const state = parseOnuState(await cli.exec('show onu state'));
-    const info = parseOnuInfo(await cli.exec('show onu info'));
+    // `show onu info` (modelo) no existe en todos los firmwares (ej. chasis Díaz Mirón) → best-effort.
+    let info = [];
+    try { info = parseOnuInfo(await cli.exec('show onu info')); } catch (_) { /* sin modelo */ }
     cli.close();
     const byId = new Map(info.map(o => [o.onuId, o]));
     return {
@@ -427,12 +594,41 @@ async function oltListOnusFull(oltCfg) {
  * Ejecuta el reboot de una ONU concreta (contexto `interface gpon <slot>/<port>`).
  * `slot` = tarjeta (0 en OLTs tipo caja; 1..N en chasis con varias tarjetas).
  */
-async function rebootInSession(cli, slot, port, onuId) {
-  await cli.exec(`interface gpon ${slot}/${port}`);
-  const out = await cli.exec(buildRebootCmd(onuId), 20000);
+/**
+ * Envía el comando de reinicio tolerando firmwares que, tras ejecutarlo, emiten
+ * eventos asíncronos y/o cierran la sesión (ej. chasis Díaz Mirón: "Logout" +
+ * "ONU Offline ..."). Conserva la salvaguarda: si la OLT dice "Unknown command"
+ * NO lo da por bueno. Si no hay error y aparece evidencia de ejecución (o vence el
+ * plazo sin prompt), se considera enviado.
+ */
+function sendRebootCmd(cli, cmd, timeoutMs = 18000) {
+  return new Promise((resolve, reject) => {
+    cli.buffer = '';
+    cli.stream.write(cmd + '\n');
+    const started = Date.now();
+    const tick = () => {
+      const clean = stripAnsi(cli.buffer);
+      if (/%\s*Unknown command|%\s*There is no matched|Command incomplete/i.test(clean)) {
+        return reject(new Error(`La OLT no reconoce el comando: "${cmd}"`));
+      }
+      const tail = clean.slice(-300).trimEnd();
+      if (PROMPT_RE.test(tail)) return resolve(clean);                       // prompt normal (caso común)
+      if (/reboot\s*OK|ONU\s*Offline|log\s*out|Logout/i.test(clean)) return resolve(clean); // ejecutó aunque cierre sesión/emita evento
+      if (Date.now() - started > timeoutMs) return resolve(clean);           // enviado sin error de comando
+      setTimeout(tick, 150);
+    };
+    tick();
+  });
+}
+
+async function rebootInSession(cli, slot, port, onuId, tec) {
+  await cli.exec(`interface ${interfaceKw(tec)} ${slot}/${port}`);
+  const out = await sendRebootCmd(cli, buildRebootCmdFor(tec, onuId), 20000);
   let state = null;
   try {
-    state = parseOnuState(await cli.exec('show onu state')).find(s => s.onuId === onuId) || null;
+    const raw = await cli.exec(stateCmd(tec));
+    const parsed = isEpon(tec) ? parseOnuStateEpon(raw) : parseOnuState(raw);
+    state = parsed.find(s => s.onuId === onuId) || null;
   } catch (_) { /* la verificación es best-effort */ }
   try { await cli.exec('exit'); } catch (_) {}
   return { cliOutput: (out || '').trim().slice(0, 300), state };
@@ -452,9 +648,10 @@ async function oltRebootOnu(oltCfg, { slot = 0, port, onuId }) {
   try {
     await cli.connect();
     await cli.login();
-    const { cliOutput, state } = await rebootInSession(cli, s, p, id);
+    const { cliOutput, state } = await rebootInSession(cli, s, p, id, oltCfg.tec);
     cli.close();
-    return { success: true, slot: s, port: p, onuId: id, message: `Comando de reboot enviado a GPON${s}/${p}:${id}`, cliOutput, state };
+    const tag = interfaceKw(oltCfg.tec).toUpperCase();
+    return { success: true, slot: s, port: p, onuId: id, message: `Comando de reboot enviado a ${tag}${s}/${p}:${id}`, cliOutput, state };
   } catch (e) {
     cli.close();
     return { success: false, message: e.message || 'Error enviando reboot' };
@@ -499,7 +696,7 @@ async function oltFindAndRebootByPppoe(oltCfg, pppUser) {
     }
 
     const t = matches[0];
-    const { cliOutput, state } = await rebootInSession(cli, t.slot, t.port, t.onuId);
+    const { cliOutput, state } = await rebootInSession(cli, t.slot, t.port, t.onuId, oltCfg.tec);
     cli.close();
     return {
       success: true,
