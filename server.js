@@ -715,7 +715,11 @@ async function getOltsMap() {
 }
 
 async function findOnuByUsername(oltId, pppUser) {
-  let cleanUser = pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '');
+  // .trim(): 97 clientes del padron traen el pppuser con espacios sobrantes
+  // (26 solo en Huauchinango). SmartOLT compara exacto, asi que a esos nunca
+  // se les encontraba y el reinicio no ocurria — en silencio, porque "no
+  // encontrado" y "no existe" se ven igual desde afuera.
+  let cleanUser = pppUser.replace(/^<?(pppoe-)?/, '').replace(/>$/, '').trim();
   console.log(`[SmartOLT] Buscando ONU con username=${cleanUser} en OLT ${oltId}...`);
 
   try {
