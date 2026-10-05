@@ -1761,7 +1761,7 @@ const server = http.createServer(async (req, res) => {
     }),
     '/olt/onu-wan': (cfg, p) => oltConfigurarWan(cfg, {
       ponPort: parseInt(p.ponPort, 10), onuId: parseInt(p.onuId, 10),
-      pppUser: p.pppUser, pppPass: p.pppPass, ssid: p.ssid, wifiKey: p.wifiKey,
+      pppUser: p.pppUser, pppPass: p.pppPass, ssid: p.ssid, ssid5: p.ssid5, wifiKey: p.wifiKey,
       dryRun: p.dryRun === true, save: p.save !== false,
     }),
     // Diagnostico acotado a una ONU (ver olt-vsol.js): ayuda `?` y un comando `onu <id> pri ...`

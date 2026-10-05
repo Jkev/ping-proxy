@@ -850,7 +850,8 @@ function normalizarLinea(line, onuId) {
     .replace(/^onu\s+\d+\b/i, 'onu {ID}')
     .replace(/\bsn\s+[A-Za-z0-9]+/i, 'sn {SN}')
     .replace(/(\bpppoe\b.*\buser\s+)\S+(\s+pwd\s+)\S+/i, '$1{USER}$2{PWD}')
-    .replace(/(\bwifi_ssid\s+\d+\s+name\s+)\S+/i, '$1{SSID}')
+    // ssid 1-4 son la banda de 2.4 GHz y 5-8 la de 5 GHz en los doble banda (V364, V222, H223)
+    .replace(/(\bwifi_ssid\s+(\d+)\s+name\s+)\S+/i, (m, pre, n) => `${pre}${parseInt(n, 10) >= 5 ? '{SSID5}' : '{SSID}'}`)
     .replace(/(\bshared_key\s+)\S+/i, '$1{WIFIKEY}');
 }
 
@@ -924,7 +925,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null } =
 const VALOR_CLI_RE = /^[A-Za-z0-9_.@\-]+$/;
 
 function llenarPlantilla(lineas, valores) {
-  return lineas.map(l => l.replace(/\{(ID|SN|USER|PWD|SSID|WIFIKEY)\}/g, (_, k) => {
+  return lineas.map(l => l.replace(/\{(ID|SN|USER|PWD|SSID5|SSID|WIFIKEY)\}/g, (_, k) => {
     const v = valores[k];
     if (v == null || v === '') throw new Error(`Falta el valor ${k} para la plantilla`);
     return String(v);
@@ -1039,9 +1040,11 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
  * Antes de escribir devuelve el respaldo: las lineas que esa ONU tenia, para
  * poder regresarlas. Con `dryRun` no escribe nada.
  */
-async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, wifiKey, dryRun = false, save = true }) {
+async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true }) {
   if (!ponPort || !onuId) return { success: false, message: 'Faltan ponPort y onuId' };
-  for (const [k, v] of Object.entries({ pppUser, pppPass, ssid, wifiKey })) {
+  // SSID de 5 GHz: solo lo usan los modelos doble banda; sin el, la misma red en las dos bandas
+  ssid5 = ssid5 || ssid;
+  for (const [k, v] of Object.entries({ pppUser, pppPass, ssid, ssid5, wifiKey })) {
     if (!v || !VALOR_CLI_RE.test(String(v))) return { success: false, message: `${k} vacio o con caracteres que la OLT no acepta (solo letras, numeros, _ . @ -)` };
   }
   if (String(wifiKey).length < 8) return { success: false, message: 'La clave WiFi debe tener al menos 8 caracteres' };
@@ -1062,13 +1065,15 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       cli.close();
       return { success: false, message: `No existe la ONU ${slot}/${ponPort}:${onuId} en la OLT (autorizala primero)` };
     }
-    const comandos = llenarPlantilla(plantilla.pri.lineas, { ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, WIFIKEY: wifiKey });
+    const comandos = llenarPlantilla(plantilla.pri.lineas, { ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, SSID5: ssid5, WIFIKEY: wifiKey });
     // Los `pri wan_adv` solo quedan en la OLT hasta el commit: sin el, el modem
     // sigue con su WAN de fabrica (tr069, VLAN 46). Es el "Submit" de la web.
     // Verificado en Tuxpan 2026-10-05 (`onu <id> pri wan_adv ?` lista `commit`).
     // El WiFi no tiene commit propio. No entra a la plantilla porque el
     // running-config no lo guarda.
     if (comandos.some(l => /\bpri\s+wan_adv\b/i.test(l))) comandos.push(`onu ${onuId} pri wan_adv commit`);
+    // Modelos con la sintaxis vieja (`wan_conn`, p.ej. V342): su commit es otro (manual V1600D 17.6.13).
+    if (comandos.some(l => /\bpri\s+wan_conn\b/i.test(l))) comandos.push(`onu ${onuId} pri wan_conn commit`);
     const yaTeniaPri = respaldo.some(esLineaPri);
 
     if (dryRun) {
