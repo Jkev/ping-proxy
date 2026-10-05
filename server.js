@@ -3,7 +3,7 @@ const http = require('http');
 const { RouterOSAPI } = require('routeros');
 const cron = require('node-cron');
 const fetch = require('node-fetch');
-const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe } = require('./olt-vsol');
+const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe, oltPlantilla, oltAuthorizeAprendido, oltConfigurarWan } = require('./olt-vsol');
 const { ucmStatus, ucmReboot } = require('./ucm-ssh');
 
 // Configuración
@@ -1738,6 +1738,49 @@ const server = http.createServer(async (req, res) => {
           { host: oltHost, port: oltPort, user: oltUser, pass: oltPass, enablePass, transport, tec, slot },
           { ponPort: parseInt(ponPort, 10), sn, desc, lineProfile, srvProfile, save: save !== false }
         );
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (e) {
+        console.error('[Error]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
+  // ---- Alta de servicio: plantillas aprendidas de la OLT (ver olt-vsol.js) ----
+  // Las tres aceptan dryRun y devuelven los comandos; plantilla solo lee.
+  const RUTAS_ALTA = {
+    '/olt/plantilla': (cfg, p) => oltPlantilla(cfg, { ponPort: p.ponPort ? parseInt(p.ponPort, 10) : null }),
+    '/olt/authorize-aprendido': (cfg, p) => oltAuthorizeAprendido(cfg, {
+      ponPort: parseInt(p.ponPort, 10), sn: p.sn, desc: p.desc, dryRun: p.dryRun === true, save: p.save !== false,
+    }),
+    '/olt/onu-wan': (cfg, p) => oltConfigurarWan(cfg, {
+      ponPort: parseInt(p.ponPort, 10), onuId: parseInt(p.onuId, 10),
+      pppUser: p.pppUser, pppPass: p.pppPass, ssid: p.ssid, wifiKey: p.wifiKey,
+      dryRun: p.dryRun === true, save: p.save !== false,
+    }),
+  };
+  if (req.method === 'POST' && RUTAS_ALTA[req.url]) {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' })); return;
+    }
+    const ruta = req.url;
+    let body = '';
+    req.on('data', c => { body += c; });
+    req.on('end', async () => {
+      try {
+        const p = JSON.parse(body);
+        if (!p.oltHost || !p.oltUser || !p.oltPass) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass' })); return;
+        }
+        console.log(`[Request] ${ruta} en ${p.oltHost}${p.ponPort ? ` pon ${p.ponPort}` : ''}${p.dryRun ? ' (dry-run)' : ''}`);
+        const cfg = { host: p.oltHost, port: p.oltPort, user: p.oltUser, pass: p.oltPass, enablePass: p.enablePass, transport: p.transport, tec: p.tec, slot: p.slot };
+        const result = await RUTAS_ALTA[ruta](cfg, p);
         res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result));
       } catch (e) {

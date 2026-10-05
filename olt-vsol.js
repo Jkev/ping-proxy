@@ -790,8 +790,291 @@ async function oltFindAndRebootByPppoe(oltCfg, pppUser) {
   }
 }
 
+// ==================== ALTA DE SERVICIO (plantillas aprendidas de la OLT) ====================
+//
+// La config de una ONU nueva no se inventa: se copia de lo que la propia OLT ya
+// tiene. Hay dos estilos de autorizacion en el parque (perfiles `profile line/srv`
+// o el bloque tcont/gemport/service/service-port/portvlan escrito por ONU) y la
+// config del modem (`pri wan_adv` / `pri wifi_ssid`) se repite casi identica en
+// miles de ONUs. Se normaliza cada bloque cambiando lo que es propio del cliente
+// (id, SN, desc, usuario, clave, SSID, clave WiFi) por marcadores, y la plantilla
+// es la forma MAS COMUN. Su frecuencia viaja en la respuesta: si la plantilla
+// ganadora la tienen 9 de 10 ONUs, el generador esta bien; si la tienen 2 de 10,
+// hay que mirarla antes de mandarla.
+
+/**
+ * Agrupa el running-config por ONU: { 'slot/port:onuId' → [lineas `onu ...`] }.
+ * Conserva el orden en que la OLT las imprime (es el orden en que se aplicaron).
+ */
+function parseOnuBlocks(output) {
+  const blocks = new Map();
+  let curSlot = 0;
+  let curPort = null;
+  for (const raw of stripAnsi(output).split('\n')) {
+    const line = raw.trim();
+    const ctx = line.match(/^interface\s+[ge]pon\s+(\d+)\/(\d+)/i);
+    if (ctx) { curSlot = parseInt(ctx[1], 10); curPort = parseInt(ctx[2], 10); continue; }
+    if (/^(interface|exit)\b/i.test(line)) { curPort = null; continue; }
+    if (curPort == null) continue;
+    const m = line.match(/^onu\s+(?:add\s+)?(\d+)\b/i);
+    if (!m) continue;
+    const key = `${curSlot}/${curPort}:${parseInt(m[1], 10)}`;
+    if (!blocks.has(key)) blocks.set(key, []);
+    blocks.get(key).push(line);
+  }
+  return blocks;
+}
+
+const esLineaPri = (l) => /^onu\s+\d+\s+pri\b/i.test(l);
+const esLineaDesc = (l) => /^onu\s+\d+\s+desc(?:ription)?\b/i.test(l);
+
+/**
+ * Cambia lo propio de la ONU/cliente por marcadores para poder comparar bloques.
+ * El `service-port` del estilo "bloque" suele numerarse igual que la ONU: si
+ * coincide con su id tambien se marca, o cada bloque quedaria distinto.
+ */
+function normalizarLinea(line, onuId) {
+  return line
+    .replace(/(\bservice-port\s+)(\d+)\b/i,(m, pre, n) => (parseInt(n, 10) === onuId ? `${pre}{ID}` : m))
+    .replace(/^onu\s+add\s+\d+\b/i, 'onu add {ID}')
+    .replace(/^onu\s+\d+\b/i, 'onu {ID}')
+    .replace(/\bsn\s+[A-Za-z0-9]+/i, 'sn {SN}')
+    .replace(/(\bpppoe\b.*\buser\s+)\S+(\s+pwd\s+)\S+/i, '$1{USER}$2{PWD}')
+    .replace(/(\bwifi_ssid\s+\d+\s+name\s+)\S+/i, '$1{SSID}')
+    .replace(/(\bshared_key\s+)\S+/i, '$1{WIFIKEY}');
+}
+
+/** La forma mas comun de una lista de bloques normalizados. */
+function formaMasComun(bloques) {
+  const cuenta = new Map();
+  for (const b of bloques) {
+    if (!b.length) continue;
+    const k = b.join('\n');
+    cuenta.set(k, (cuenta.get(k) || 0) + 1);
+  }
+  let mejor = null;
+  let n = 0;
+  for (const [k, c] of cuenta) if (c > n) { mejor = k; n = c; }
+  return {
+    lineas: mejor ? mejor.split('\n') : [],
+    coinciden: n,
+    total: bloques.filter(b => b.length).length,
+    variantes: cuenta.size,
+  };
+}
+
+/**
+ * Aprende de un running-config:
+ *   - auth: el bloque de autorizacion (todo menos desc y pri) mas comun del
+ *     PUERTO pedido; si el puerto no tiene ONUs, el de toda la OLT.
+ *   - pri:  la config de modem mas comun de la OLT (solo ONUs en modo router).
+ *   - estilo: 'perfiles' | 'bloque', leido de la plantilla de auth.
+ */
+function aprenderPlantillas(output, { slot = 0, ponPort = null } = {}) {
+  const blocks = parseOnuBlocks(output);
+  const auth = [];
+  const authPuerto = [];
+  const pri = [];
+  for (const [key, lines] of blocks) {
+    const id = parseInt(key.split(':')[1], 10);
+    const norm = (l) => normalizarLinea(l, id);
+    const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm);
+    const p = lines.filter(esLineaPri).map(norm);
+    auth.push(a);
+    if (ponPort != null && key.startsWith(`${slot}/${ponPort}:`)) authPuerto.push(a);
+    if (p.some(l => l.includes('{USER}'))) pri.push(p);
+  }
+  const authFuente = authPuerto.filter(b => b.length).length ? 'puerto' : 'olt';
+  const authPlantilla = formaMasComun(authFuente === 'puerto' ? authPuerto : auth);
+  const estilo = authPlantilla.lineas.some(l => /\bprofile\s+line\b/i.test(l)) ? 'perfiles' : 'bloque';
+  return {
+    onus: blocks.size,
+    auth: { ...authPlantilla, fuente: authFuente, estilo },
+    pri: formaMasComun(pri),
+  };
+}
+
+/** Valores que van pegados al CLI: sin espacios ni nada que la OLT pueda leer como otro argumento. */
+const VALOR_CLI_RE = /^[A-Za-z0-9_.@\-]+$/;
+
+function llenarPlantilla(lineas, valores) {
+  return lineas.map(l => l.replace(/\{(ID|SN|USER|PWD|SSID|WIFIKEY)\}/g, (_, k) => {
+    const v = valores[k];
+    if (v == null || v === '') throw new Error(`Falta el valor ${k} para la plantilla`);
+    return String(v);
+  }));
+}
+
+/** Ejecuta un comando y trata cualquier `% ...` de la OLT como error (no solo Unknown/Incomplete). */
+async function execEstricto(cli, cmd, timeoutMs = 20000) {
+  const out = await cli.exec(cmd, timeoutMs);
+  const err = out.split('\n').map(l => l.trim()).find(l => /^%\s*\S/.test(l) || /\b(error|failed|invalid)\b/i.test(l));
+  if (err) throw new Error(`La OLT rechazo "${cmd}": ${err}`);
+  return out;
+}
+
+async function guardarConfig(cli) {
+  for (const cmd of ['write', 'copy running-config startup-config', 'write file']) {
+    try { await cli.exec(cmd, 30000); return true; } catch (_) { /* probar siguiente */ }
+  }
+  return false;
+}
+
+/** Plantillas aprendidas de la OLT (solo lectura). */
+async function oltPlantilla(oltCfg, { ponPort = null } = {}) {
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const cfg = await cli.exec('show running-config', 60000);
+    cli.close();
+    const slot = parseInt(oltCfg.slot, 10) || 0;
+    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort }) };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error leyendo running-config' };
+  }
+}
+
+/**
+ * Autoriza una ONU copiando el estilo de autorizacion del puerto.
+ * Idempotente por SN. Con `dryRun` solo lee (show onu info + running-config)
+ * y devuelve los comandos que mandaria.
+ */
+async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false, save = true }) {
+  if (!ponPort || !sn) return { success: false, message: 'Faltan ponPort y sn' };
+  if (!VALOR_CLI_RE.test(sn)) return { success: false, message: `SN invalido: "${sn}"` };
+  if (isEpon(oltCfg.tec)) return { success: false, message: 'La autorizacion automatica en OLTs EPON aun no esta soportada' };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const pon = `GPON${slot}/${ponPort}`;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const cfg = await cli.exec('show running-config', 60000);
+    const plantilla = aprenderPlantillas(cfg, { slot, ponPort });
+    if (!plantilla.auth.lineas.length) {
+      cli.close();
+      return { success: false, message: 'La OLT no tiene ninguna ONU de la cual copiar la autorizacion' };
+    }
+    if (!plantilla.auth.lineas.some(l => /^onu add \{ID\}/.test(l))) {
+      cli.close();
+      return { success: false, message: 'La plantilla aprendida no trae la linea `onu add`: revisar la OLT a mano', plantilla: plantilla.auth };
+    }
+
+    await cli.exec(`interface gpon ${slot}/${ponPort}`);
+    const existing = parseOnuInfo(await cli.exec('show onu info'));
+    const dup = existing.find(o => o.sn && o.sn.toLowerCase() === sn.toLowerCase());
+    if (dup) {
+      cli.close();
+      return { success: true, alreadyExists: true, onuId: dup.onuId, ponPort, sn, plantilla: plantilla.auth, message: `La ONU ${sn} ya estaba autorizada como ${pon}:${dup.onuId}` };
+    }
+    const used = new Set(existing.map(o => o.onuId));
+    let onuId = 1;
+    while (used.has(onuId)) onuId++;
+
+    const cleanDesc = sanitizeDesc(desc);
+    const auth = llenarPlantilla(plantilla.auth.lineas, { ID: onuId, SN: sn });
+    // el `onu add` primero (sin el la ONU no existe) y la desc justo despues, como la escribe soporte
+    const iAdd = auth.findIndex(l => /^onu\s+add\b/i.test(l));
+    const comandos = [auth[iAdd], `onu ${onuId} desc ${cleanDesc}`, ...auth.filter((_, i) => i !== iAdd)];
+
+    if (dryRun) {
+      cli.close();
+      return { success: true, dryRun: true, onuId, ponPort, sn, comandos, plantilla: plantilla.auth };
+    }
+
+    const enviados = [];
+    for (const cmd of comandos) {
+      await execEstricto(cli, cmd);
+      enviados.push(cmd);
+    }
+    const after = parseOnuInfo(await cli.exec('show onu info'));
+    const added = after.find(o => o.onuId === onuId && o.sn && o.sn.toLowerCase() === sn.toLowerCase());
+    if (!added) {
+      cli.close();
+      return { success: false, message: `Se enviaron los comandos pero la ONU ${sn} no aparece en show onu info — revisar manualmente`, onuId, ponPort, comandos: enviados };
+    }
+    let saved = false;
+    if (save) { await cli.exec('exit'); saved = await guardarConfig(cli); }
+    cli.close();
+    return {
+      success: true, onuId, ponPort, sn, desc: cleanDesc, saved, comandos: enviados, plantilla: plantilla.auth,
+      message: `ONU ${sn} autorizada como ${pon}:${onuId} (${plantilla.auth.estilo})${saved ? ' y config guardada' : ' — ADVERTENCIA: no se pudo guardar la config'}`,
+    };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error autorizando ONU' };
+  }
+}
+
+/**
+ * Escribe PPPoE + WiFi en una ONU V-SOL con los `pri` de la plantilla de la OLT.
+ * Antes de escribir devuelve el respaldo: las lineas que esa ONU tenia, para
+ * poder regresarlas. Con `dryRun` no escribe nada.
+ */
+async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, wifiKey, dryRun = false, save = true }) {
+  if (!ponPort || !onuId) return { success: false, message: 'Faltan ponPort y onuId' };
+  for (const [k, v] of Object.entries({ pppUser, pppPass, ssid, wifiKey })) {
+    if (!v || !VALOR_CLI_RE.test(String(v))) return { success: false, message: `${k} vacio o con caracteres que la OLT no acepta (solo letras, numeros, _ . @ -)` };
+  }
+  if (String(wifiKey).length < 8) return { success: false, message: 'La clave WiFi debe tener al menos 8 caracteres' };
+  if (isEpon(oltCfg.tec)) return { success: false, message: 'La config de modem en OLTs EPON aun no esta soportada' };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const cfg = await cli.exec('show running-config', 60000);
+    const plantilla = aprenderPlantillas(cfg, { slot, ponPort });
+    if (!plantilla.pri.lineas.length) {
+      cli.close();
+      return { success: false, message: 'La OLT no tiene ninguna ONU en modo router de la cual copiar la config' };
+    }
+    const respaldo = parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${onuId}`) || [];
+    if (!respaldo.length) {
+      cli.close();
+      return { success: false, message: `No existe la ONU ${slot}/${ponPort}:${onuId} en la OLT (autorizala primero)` };
+    }
+    const comandos = llenarPlantilla(plantilla.pri.lineas, { ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, WIFIKEY: wifiKey });
+    const yaTeniaPri = respaldo.some(esLineaPri);
+
+    if (dryRun) {
+      cli.close();
+      return { success: true, dryRun: true, comandos, respaldo, yaTeniaPri, plantilla: plantilla.pri };
+    }
+
+    await cli.exec(`interface gpon ${slot}/${ponPort}`);
+    const enviados = [];
+    try {
+      for (const cmd of comandos) {
+        await execEstricto(cli, cmd);
+        enviados.push(cmd);
+      }
+    } catch (e) {
+      cli.close();
+      return { success: false, message: e.message, comandos: enviados, pendientes: comandos.slice(enviados.length), respaldo };
+    }
+    let saved = false;
+    if (save) { await cli.exec('exit'); saved = await guardarConfig(cli); }
+    cli.close();
+    return {
+      success: true, comandos: enviados, respaldo, yaTeniaPri, saved, plantilla: plantilla.pri,
+      message: `Config de modem enviada a GPON${slot}/${ponPort}:${onuId}${saved ? ' y guardada' : ' — ADVERTENCIA: no se pudo guardar la config'}`,
+    };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error configurando la ONU' };
+  }
+}
+
 module.exports = {
   VsolCli,
+  parseOnuBlocks,
+  aprenderPlantillas,
+  oltPlantilla,
+  oltAuthorizeAprendido,
+  oltConfigurarWan,
   stripAnsi,
   parseAutoFind,
   parseOnuInfo,
