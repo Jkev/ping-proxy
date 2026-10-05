@@ -1063,6 +1063,12 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       return { success: false, message: `No existe la ONU ${slot}/${ponPort}:${onuId} en la OLT (autorizala primero)` };
     }
     const comandos = llenarPlantilla(plantilla.pri.lineas, { ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, WIFIKEY: wifiKey });
+    // Los `pri wan_adv` solo quedan en la OLT hasta el commit: sin el, el modem
+    // sigue con su WAN de fabrica (tr069, VLAN 46). Es el "Submit" de la web.
+    // Verificado en Tuxpan 2026-10-05 (`onu <id> pri wan_adv ?` lista `commit`).
+    // El WiFi no tiene commit propio. No entra a la plantilla porque el
+    // running-config no lo guarda.
+    if (comandos.some(l => /\bpri\s+wan_adv\b/i.test(l))) comandos.push(`onu ${onuId} pri wan_adv commit`);
     const yaTeniaPri = respaldo.some(esLineaPri);
 
     if (dryRun) {
