@@ -1094,8 +1094,77 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
   }
 }
 
+// ==================== DIAGNOSTICO ACOTADO A UNA ONU ====================
+// Para mapear la sintaxis `pri` (p.ej. el equivalente CLI del "Submit" del
+// running-config en la web de la OLT) sin abrir una consola libre:
+//   - ayuda: solo lineas que terminan en `?`, mandadas SIN Enter y borradas con
+//     Ctrl-U (mismo metodo de scripts/olt-reboot-probe.js): nunca se ejecutan.
+//   - comando: UNA linea que empiece con `onu <onuId> pri` o sea `onu <onuId> reboot`,
+//     dentro de su puerto. Nada de otras ONUs, nada fuera del contexto del puerto.
+
+function ayudaCruda(cli, linea, idleMs = 1500) {
+  return new Promise((resolve) => {
+    cli.buffer = '';
+    cli.stream.write(linea);
+    setTimeout(() => {
+      const out = stripAnsi(cli.buffer);
+      cli.stream.write('\x15'); // Ctrl-U: descarta la linea sin ejecutarla
+      setTimeout(() => { cli.buffer = ''; resolve(out); }, 300);
+    }, idleMs);
+  });
+}
+
+async function oltAyudaOnu(oltCfg, { ponPort, consultas = [] }) {
+  if (!ponPort || !consultas.length) return { success: false, message: 'Faltan ponPort y consultas' };
+  const malas = consultas.filter(q => !/^[\w .\-\/]*\?$/.test(q) || /[\r\n;|]/.test(q));
+  if (malas.length) return { success: false, message: `Solo consultas que terminan en "?": ${malas.join(' | ')}` };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    await cli.exec(`interface ${interfaceKw(oltCfg.tec)} ${slot}/${ponPort}`);
+    const respuestas = [];
+    for (const q of consultas.slice(0, 20)) respuestas.push({ consulta: q, salida: (await ayudaCruda(cli, q)).trim().slice(0, 4000) });
+    cli.close();
+    return { success: true, respuestas };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error consultando ayuda' };
+  }
+}
+
+async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) {
+  const id = parseInt(onuId, 10);
+  const cmd = String(comando || '').trim();
+  if (!ponPort || !id || !cmd) return { success: false, message: 'Faltan ponPort, onuId y comando' };
+  if (/[\r\n;|?]/.test(cmd) || !new RegExp(`^onu\\s+${id}\\s+(pri\\b|reboot$)`, 'i').test(cmd)) {
+    return { success: false, message: `Solo un comando "onu ${id} pri ..." o "onu ${id} reboot"` };
+  }
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    await cli.exec(`interface ${interfaceKw(oltCfg.tec)} ${slot}/${ponPort}`);
+    let salida = '';
+    let error = null;
+    try { salida = await cli.exec(cmd, 30000); } catch (e) { error = e.message; }
+    const rechazo = salida.split('\n').map(l => l.trim()).find(l => /^%\s*\S/.test(l) || /\b(error|failed|invalid)\b/i.test(l));
+    let saved = false;
+    if (!error && !rechazo && save) { await cli.exec('exit'); saved = await guardarConfig(cli); }
+    cli.close();
+    return { success: !error && !rechazo, comando: cmd, salida: salida.trim().slice(0, 4000), message: error || rechazo || 'Comando enviado', saved };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error enviando comando' };
+  }
+}
+
 module.exports = {
   VsolCli,
+  oltAyudaOnu,
+  oltComandoOnu,
   parseOnuBlocks,
   aprenderPlantillas,
   oltPlantilla,
