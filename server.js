@@ -1752,7 +1752,10 @@ const server = http.createServer(async (req, res) => {
   // ---- Alta de servicio: plantillas aprendidas de la OLT (ver olt-vsol.js) ----
   // Las tres aceptan dryRun y devuelven los comandos; plantilla solo lee.
   const RUTAS_ALTA = {
-    '/olt/plantilla': (cfg, p) => oltPlantilla(cfg, { ponPort: p.ponPort ? parseInt(p.ponPort, 10) : null }),
+    '/olt/plantilla': (cfg, p) => oltPlantilla(cfg, {
+      ponPort: p.ponPort ? parseInt(p.ponPort, 10) : null,
+      onuId: p.onuId ? parseInt(p.onuId, 10) : null,
+    }),
     '/olt/authorize-aprendido': (cfg, p) => oltAuthorizeAprendido(cfg, {
       ponPort: parseInt(p.ponPort, 10), sn: p.sn, desc: p.desc, dryRun: p.dryRun === true, save: p.save !== false,
     }),

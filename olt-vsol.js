@@ -877,30 +877,46 @@ function formaMasComun(bloques) {
  * Aprende de un running-config:
  *   - auth: el bloque de autorizacion (todo menos desc y pri) mas comun del
  *     PUERTO pedido; si el puerto no tiene ONUs, el de toda la OLT.
- *   - pri:  la config de modem mas comun de la OLT (solo ONUs en modo router).
+ *   - pri:  la config de modem mas comun de la OLT (solo ONUs en modo router),
+ *     aprendida de ONUs del MISMO MODELO que la destino (`onuId`). El modelo es
+ *     la linea `pri equid VSOLV414`: puertos LAN y WiFi cambian por modelo y
+ *     mezclarlos daba 67 variantes en Tuxpan con la ganadora en un 14%. La linea
+ *     `equid` nunca entra a la plantilla: cada ONU conserva la suya.
  *   - estilo: 'perfiles' | 'bloque', leido de la plantilla de auth.
  */
-function aprenderPlantillas(output, { slot = 0, ponPort = null } = {}) {
+const EQUID_RE = /^onu\s+\d+\s+pri\s+equid\s+(\S+)/i;
+
+function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null } = {}) {
   const blocks = parseOnuBlocks(output);
+  const equidDe = (lines) => { for (const l of lines) { const m = l.match(EQUID_RE); if (m) return m[1]; } return null; };
+  const destino = onuId != null ? blocks.get(`${slot}/${ponPort}:${onuId}`) : null;
+  const modelo = destino ? equidDe(destino) : null;
   const auth = [];
   const authPuerto = [];
   const pri = [];
+  const priModelo = [];
   for (const [key, lines] of blocks) {
     const id = parseInt(key.split(':')[1], 10);
     const norm = (l) => normalizarLinea(l, id);
     const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm);
-    const p = lines.filter(esLineaPri).map(norm);
+    const p = lines.filter(l => esLineaPri(l) && !EQUID_RE.test(l)).map(norm);
     auth.push(a);
     if (ponPort != null && key.startsWith(`${slot}/${ponPort}:`)) authPuerto.push(a);
-    if (p.some(l => l.includes('{USER}'))) pri.push(p);
+    if (p.some(l => l.includes('{USER}'))) {
+      pri.push(p);
+      if (modelo && equidDe(lines) === modelo) priModelo.push(p);
+    }
   }
   const authFuente = authPuerto.filter(b => b.length).length ? 'puerto' : 'olt';
   const authPlantilla = formaMasComun(authFuente === 'puerto' ? authPuerto : auth);
   const estilo = authPlantilla.lineas.some(l => /\bprofile\s+line\b/i.test(l)) ? 'perfiles' : 'bloque';
+  // Con menos de 3 del mismo modelo no hay forma "mas comun" confiable: se usa la de
+  // toda la OLT y se dice, para que la persona la revise.
+  const priFuente = priModelo.length >= 3 ? 'modelo' : 'olt';
   return {
     onus: blocks.size,
     auth: { ...authPlantilla, fuente: authFuente, estilo },
-    pri: formaMasComun(pri),
+    pri: { ...formaMasComun(priFuente === 'modelo' ? priModelo : pri), fuente: priFuente, modelo: modelo || null },
   };
 }
 
@@ -931,7 +947,7 @@ async function guardarConfig(cli) {
 }
 
 /** Plantillas aprendidas de la OLT (solo lectura). */
-async function oltPlantilla(oltCfg, { ponPort = null } = {}) {
+async function oltPlantilla(oltCfg, { ponPort = null, onuId = null } = {}) {
   const cli = new VsolCli(oltCfg);
   try {
     await cli.connect();
@@ -939,7 +955,7 @@ async function oltPlantilla(oltCfg, { ponPort = null } = {}) {
     const cfg = await cli.exec('show running-config', 60000);
     cli.close();
     const slot = parseInt(oltCfg.slot, 10) || 0;
-    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort }) };
+    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort, onuId }) };
   } catch (e) {
     cli.close();
     return { success: false, message: e.message || 'Error leyendo running-config' };
@@ -1036,7 +1052,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     await cli.connect();
     await cli.login();
     const cfg = await cli.exec('show running-config', 60000);
-    const plantilla = aprenderPlantillas(cfg, { slot, ponPort });
+    const plantilla = aprenderPlantillas(cfg, { slot, ponPort, onuId });
     if (!plantilla.pri.lineas.length) {
       cli.close();
       return { success: false, message: 'La OLT no tiene ninguna ONU en modo router de la cual copiar la config' };
