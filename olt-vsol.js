@@ -299,8 +299,10 @@ class VsolCli {
 
 // ==================== PARSERS ====================
 
-// SN estilo GPON: 4 letras + 8 hex (HWTCxxxxxxxx, GPON00700948, VSOL007e31de, MONU00296561, ZTEG...)
-const SN_RE = /\b([A-Za-z]{4}[0-9a-fA-F]{8})\b/;
+// SN estilo GPON: 4 de fabricante + 8 hex (HWTCxxxxxxxx, GPON00700948, VSOL007e31de, MONU00296561, ZTEG...).
+// El fabricante puede llevar digitos (`V25092679417` = V250 + 92679417): exigir 4
+// LETRAS hacia que el auto-find descartara esos modems y devolviera 0 en silencio.
+const SN_RE = /\b([A-Za-z][A-Za-z0-9]{3}[0-9a-fA-F]{8})\b/;
 
 /** Parsea "show onu auto-find": ONUs detectadas sin autorizar en el puerto. */
 function parseAutoFind(output, ponPort) {
@@ -498,14 +500,22 @@ async function oltAutoFind(oltCfg, ponPorts = null) {
     await cli.connect();
     await cli.login();
     const found = [];
+    // Lo que la OLT imprimio y no se reconocio como ONU: si el resultado sale
+    // vacio, esto dice si de verdad no hay nada o si el formato cambio.
+    const sinReconocer = [];
     for (const p of ports) {
       await cli.exec(`interface ${kw} ${slot}/${p}`);
       const out = await cli.exec('show onu auto-find');
-      found.push(...parseAutoFind(out, p));
+      const onus = parseAutoFind(out, p);
+      found.push(...onus);
+      if (!onus.length) {
+        const lineas = stripAnsi(out).split('\n').map(l => l.trim()).filter(Boolean);
+        if (lineas.length) sinReconocer.push({ ponPort: p, lineas: lineas.slice(0, 15) });
+      }
       await cli.exec('exit');
     }
     cli.close();
-    return { success: true, onus: found };
+    return { success: true, onus: found, ...(found.length ? {} : { sinReconocer }) };
   } catch (e) {
     cli.close();
     return { success: false, message: e.message || 'Error en auto-find', onus: [] };
