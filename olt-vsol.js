@@ -490,12 +490,16 @@ function sanitizeDesc(desc) {
 async function oltAutoFind(oltCfg, ponPorts = null) {
   const ports = ponPorts && ponPorts.length ? ponPorts : Array.from({ length: oltCfg.ponCount || 16 }, (_, i) => i + 1);
   const cli = new VsolCli(oltCfg);
+  // EPON usa `interface epon` y las OLTs de chasis su slot (Díaz Mirón = 2); el
+  // comando `show onu auto-find` es el mismo en los dos dialectos.
+  const kw = interfaceKw(oltCfg.tec);
+  const slot = parseInt(oltCfg.slot, 10) || 0;
   try {
     await cli.connect();
     await cli.login();
     const found = [];
     for (const p of ports) {
-      await cli.exec(`interface gpon 0/${p}`);
+      await cli.exec(`interface ${kw} ${slot}/${p}`);
       const out = await cli.exec('show onu auto-find');
       found.push(...parseAutoFind(out, p));
       await cli.exec('exit');
@@ -578,19 +582,24 @@ async function oltOnuState(oltCfg, ponPort) {
 async function oltAuthorizeOnu(oltCfg, { ponPort, sn, desc, lineProfile, srvProfile, save = true }) {
   if (!ponPort || !sn) return { success: false, message: 'Faltan ponPort y sn' };
   if (!lineProfile || !srvProfile) return { success: false, message: 'Faltan lineProfile y srvProfile' };
+  // La autorizacion EPON usa otra sintaxis que todavia no esta verificada: mejor
+  // negarse que mandarle a la OLT comandos de GPON.
+  if (isEpon(oltCfg.tec)) return { success: false, message: 'La autorizacion automatica en OLTs EPON aun no esta soportada' };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const pon = `GPON${slot}/${ponPort}`;
 
   const cli = new VsolCli(oltCfg);
   try {
     await cli.connect();
     await cli.login();
-    await cli.exec(`interface gpon 0/${ponPort}`);
+    await cli.exec(`interface gpon ${slot}/${ponPort}`);
 
     // ¿Ya está autorizada? (idempotencia)
     const existing = parseOnuInfo(await cli.exec('show onu info'));
     const dup = existing.find(o => o.sn && o.sn.toLowerCase() === sn.toLowerCase());
     if (dup) {
       cli.close();
-      return { success: true, alreadyExists: true, onuId: dup.onuId, ponPort, sn, message: `La ONU ${sn} ya estaba autorizada como GPON0/${ponPort}:${dup.onuId}` };
+      return { success: true, alreadyExists: true, onuId: dup.onuId, ponPort, sn, message: `La ONU ${sn} ya estaba autorizada como ${pon}:${dup.onuId}` };
     }
 
     // primer id libre
@@ -633,7 +642,7 @@ async function oltAuthorizeOnu(oltCfg, { ponPort, sn, desc, lineProfile, srvProf
       sn,
       desc: cleanDesc,
       saved,
-      message: `ONU ${sn} autorizada como GPON0/${ponPort}:${onuId} (${cleanDesc})${saved ? ' y config guardada' : ' — ADVERTENCIA: no se pudo guardar la config'}`,
+      message: `ONU ${sn} autorizada como ${pon}:${onuId} (${cleanDesc})${saved ? ' y config guardada' : ' — ADVERTENCIA: no se pudo guardar la config'}`,
     };
   } catch (e) {
     cli.close();

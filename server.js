@@ -1664,14 +1664,14 @@ const server = http.createServer(async (req, res) => {
     req.on('data', c => { body += c; });
     req.on('end', async () => {
       try {
-        const { oltHost, oltPort, oltUser, oltPass, enablePass, transport, tec, ponPorts, ponCount } = JSON.parse(body);
+        const { oltHost, oltPort, oltUser, oltPass, enablePass, transport, tec, slot, ponPorts, ponCount } = JSON.parse(body);
         if (!oltHost || !oltUser || !oltPass) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass' })); return;
         }
         console.log(`[Request] OLT auto-find en ${oltHost}`);
         const result = await oltAutoFind(
-          { host: oltHost, port: oltPort, user: oltUser, pass: oltPass, enablePass, transport, tec, ponCount },
+          { host: oltHost, port: oltPort, user: oltUser, pass: oltPass, enablePass, transport, tec, slot, ponCount },
           Array.isArray(ponPorts) ? ponPorts : null
         );
         res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
@@ -1728,14 +1728,14 @@ const server = http.createServer(async (req, res) => {
     req.on('data', c => { body += c; });
     req.on('end', async () => {
       try {
-        const { oltHost, oltPort, oltUser, oltPass, enablePass, transport, tec, ponPort, sn, desc, lineProfile, srvProfile, save } = JSON.parse(body);
+        const { oltHost, oltPort, oltUser, oltPass, enablePass, transport, tec, slot, ponPort, sn, desc, lineProfile, srvProfile, save } = JSON.parse(body);
         if (!oltHost || !oltUser || !oltPass || !ponPort || !sn || !lineProfile || !srvProfile) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ success: false, message: 'Faltan parámetros: oltHost, oltUser, oltPass, ponPort, sn, lineProfile, srvProfile' })); return;
         }
         console.log(`[Request] OLT authorize ${sn} en ${oltHost} pon 0/${ponPort}`);
         const result = await oltAuthorizeOnu(
-          { host: oltHost, port: oltPort, user: oltUser, pass: oltPass, enablePass, transport, tec },
+          { host: oltHost, port: oltPort, user: oltUser, pass: oltPass, enablePass, transport, tec, slot },
           { ponPort: parseInt(ponPort, 10), sn, desc, lineProfile, srvProfile, save: save !== false }
         );
         res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
