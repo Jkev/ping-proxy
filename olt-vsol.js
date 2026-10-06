@@ -955,6 +955,26 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
   };
 }
 
+/**
+ * `onu <id> pri wifi_switch enable <region> 0 <modo>` con la region (etsi, fcc…) y el
+ * modo (`80211n 20 40`) mas comunes de las ONUs de la OLT; canal 0 = automatico.
+ * Solo el radio de 2.4 GHz (`wifi_switch`; el de 5 es `wifi1_switch`). null si la
+ * OLT no tiene ninguna linea de donde copiar.
+ */
+function lineaRadio24(output, onuId) {
+  const cuenta = new Map();
+  for (const raw of stripAnsi(output).split('\n')) {
+    const m = raw.trim().match(/^onu\s+\d+\s+pri\s+wifi_switch\s+enable\s+([a-z0-9-]+)\s+\d+\s+(.+)$/i);
+    if (!m) continue;
+    const k = `${m[1].toLowerCase()}|${m[2].trim()}`;
+    cuenta.set(k, (cuenta.get(k) || 0) + 1);
+  }
+  const top = [...cuenta.entries()].sort((a, b) => b[1] - a[1])[0];
+  if (!top) return null;
+  const [region, modo] = top[0].split('|');
+  return `onu ${onuId} pri wifi_switch enable ${region} 0 ${modo}`;
+}
+
 /** Valores que van pegados al CLI: sin espacios ni nada que la OLT pueda leer como otro argumento. */
 const VALOR_CLI_RE = /^[A-Za-z0-9_.@\-]+$/;
 
@@ -1107,6 +1127,15 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       return { success: false, message: `No existe la ONU ${slot}/${ponPort}:${onuId} en la OLT (autorizala primero)` };
     }
     const comandos = llenarPlantilla(plantilla.pri.lineas, { ...(plantilla.pri.valores || {}), ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, SSID5: ssid5, WIFIKEY: wifiKey });
+    // Radio de 2.4 GHz: en modelos como el V364 la forma mas comun no trae
+    // `wifi_switch` (el radio viene encendido de fabrica)... salvo cuando no
+    // (Lazaro, Buenos Aires 2026-10-06: sin esta linea la red de 2.4 no salia). Si
+    // falta, se agrega con la region y el modo mas comunes de la OLT y canal 0
+    // (automatico). Es el "cambio de region" que soporte hacia a mano.
+    const radio24 = lineaRadio24(cfg, onuId);
+    if (radio24 && !comandos.some(l => /\bpri\s+wifi_switch\b/i.test(l)) && comandos.some(l => /\bpri\s+wifi_ssid\s+[1-4]\b/i.test(l))) {
+      comandos.unshift(radio24);
+    }
     // Los `pri wan_adv` solo quedan en la OLT hasta el commit: sin el, el modem
     // sigue con su WAN de fabrica (tr069, VLAN 46). Es el "Submit" de la web.
     // Verificado en Tuxpan 2026-10-05 (`onu <id> pri wan_adv ?` lista `commit`).
