@@ -1098,7 +1098,11 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       return { success: false, message: 'La OLT no tiene ninguna ONU en modo router de la cual copiar la config' };
     }
     const respaldo = parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${onuId}`) || [];
-    if (!respaldo.length) {
+    // EPON: una ONU recien registrada solo tiene `confirm onu mac <mac> onuid <id>` a
+    // nivel de puerto (ninguna linea `onu <id> ...`): existe y esta lista para configurar.
+    const registradaEpon = isEpon(oltCfg.tec)
+      && parseRunningConfig(cfg).some(o => o.port === ponPort && o.onuId === onuId && o.mac);
+    if (!respaldo.length && !registradaEpon) {
       cli.close();
       return { success: false, message: `No existe la ONU ${slot}/${ponPort}:${onuId} en la OLT (autorizala primero)` };
     }
