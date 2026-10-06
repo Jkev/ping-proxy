@@ -1304,12 +1304,15 @@ async function oltConfigPuerto(oltCfg, { ponPort, onuIds = [] }) {
  * puerto (EPON no trae `pri equid` en el running-config). Lista cerrada: nada
  * de WiFi ni WAN, que traen claves.
  */
-const SHOW_ONU_RE = /^show onu (basic-info( all)?|\d+ ctc (onu_info|ctc_info|onu_sn|fw_ver|chip_id)|\d+ pri (onu_ver|support_info|onu_mode))$/i;
+// Diagnóstico físico (solo lectura): potencia óptica, distancia, errores de bit y tráfico
+// de una ONU. Sin esto no había forma de revisar desde el panel si un speedtest bajo es
+// la fibra (caso Palma Real, 2026-10-06).
+const SHOW_ONU_RE = /^show onu (basic-info( all)?|\d+ ctc (onu_info|ctc_info|onu_sn|fw_ver|chip_id)|\d+ pri (onu_ver|support_info|onu_mode)|\d+ (optical_info|distance|ber|statistics))$/i;
 
 async function oltShowOnu(oltCfg, { ponPort, comandos = [] }) {
   if (!ponPort || !comandos.length) return { success: false, message: 'Faltan ponPort y comandos' };
   const malos = comandos.filter(c => !SHOW_ONU_RE.test(String(c).trim()));
-  if (malos.length) return { success: false, message: `Solo consultas de modelo/version: ${malos.join(' | ')}` };
+  if (malos.length) return { success: false, message: `Solo consultas de modelo, version y diagnostico fisico: ${malos.join(' | ')}` };
   const slot = parseInt(oltCfg.slot, 10) || 0;
   const cli = new VsolCli(oltCfg);
   try {
