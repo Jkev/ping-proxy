@@ -511,7 +511,7 @@ async function oltAutoFind(oltCfg, ponPorts = null) {
     const sinReconocer = [];
     for (const p of ports) {
       await cli.exec(`interface ${kw} ${slot}/${p}`);
-      const out = await cli.exec('show onu auto-find');
+      const out = await cli.exec('show onu auto-find', 30000);
       const onus = parseAutoFind(out, p);
       found.push(...onus);
       if (!onus.length) {
@@ -676,7 +676,7 @@ async function oltListOnusFull(oltCfg) {
   try {
     await cli.connect();
     await cli.login();
-    const cfg = await cli.exec('show running-config', 45000);
+    const cfg = await cli.exec('show running-config', 120000);
     cli.close();
     return { success: true, onus: parseRunningConfig(cfg) };
   } catch (e) {
@@ -769,7 +769,7 @@ async function oltFindAndRebootByPppoe(oltCfg, pppUser) {
   try {
     await cli.connect();
     await cli.login();
-    const cfg = await cli.exec('show running-config', 45000);
+    const cfg = await cli.exec('show running-config', 120000);
     const onus = parseRunningConfig(cfg);
     const matches = onus.filter(o => o.pppoeUser && o.pppoeUser.toLowerCase() === target);
 
@@ -1009,7 +1009,7 @@ async function oltPlantilla(oltCfg, { ponPort = null, onuId = null, modelo = nul
   try {
     await cli.connect();
     await cli.login();
-    const cfg = await cli.exec('show running-config', 60000);
+    const cfg = await cli.exec('show running-config', 120000);
     cli.close();
     const slot = parseInt(oltCfg.slot, 10) || 0;
     return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo }) };
@@ -1034,7 +1034,7 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
   try {
     await cli.connect();
     await cli.login();
-    const cfg = await cli.exec('show running-config', 60000);
+    const cfg = await cli.exec('show running-config', 120000);
     const plantilla = aprenderPlantillas(cfg, { slot, ponPort });
     if (!plantilla.auth.lineas.length) {
       cli.close();
@@ -1140,7 +1140,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
   try {
     await cli.connect();
     await cli.login();
-    const cfg = await cli.exec('show running-config', 60000);
+    const cfg = await cli.exec('show running-config', 120000);
     const plantilla = aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo });
     if (!plantilla.pri.lineas.length) {
       cli.close();
@@ -1277,7 +1277,7 @@ async function oltConfigPuerto(oltCfg, { ponPort, onuIds = [] }) {
   try {
     await cli.connect();
     await cli.login();
-    const cfg = await cli.exec('show running-config', 60000);
+    const cfg = await cli.exec('show running-config', 120000);
     cli.close();
     const puerto = [];
     let dentro = false;
