@@ -893,25 +893,44 @@ function formaMasComun(bloques) {
  */
 const EQUID_RE = /^onu\s+\d+\s+pri\s+equid\s+(\S+)/i;
 
-function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null } = {}) {
+/** Canal WiFi de una linea `pri wifi_switch enable etsi 6 ...` (EPON). */
+const CANAL_RE = /(\b(?:etsi|fcc)\s+)(\d+)\b/i;
+
+/**
+ * EPON (Buenos Aires 2026-10-06): no hay `pri equid`; el modelo lo da el que llama
+ * (`modelo` + `mismoModelo`: llaves "slot/puerto:onu" de las ONUs de ese modelo,
+ * leidas con `show onu <id> ctc onu_info`). El canal WiFi cambia por ONU (cada quien
+ * escogio uno): no cuenta como diferencia y se usa el mas comun de su modelo.
+ */
+function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, tec = 'gpon', modelo: modeloDado = null, mismoModelo = null } = {}) {
   const blocks = parseOnuBlocks(output);
+  const epon = isEpon(tec);
   const equidDe = (lines) => { for (const l of lines) { const m = l.match(EQUID_RE); if (m) return m[1]; } return null; };
   const destino = onuId != null ? blocks.get(`${slot}/${ponPort}:${onuId}`) : null;
-  const modelo = destino ? equidDe(destino) : null;
+  const modelo = modeloDado || (destino ? equidDe(destino) : null);
+  const delModelo = Array.isArray(mismoModelo) ? new Set(mismoModelo.map(String)) : null;
   const auth = [];
   const authPuerto = [];
   const pri = [];
   const priModelo = [];
+  const canales = new Map();
   for (const [key, lines] of blocks) {
     const id = parseInt(key.split(':')[1], 10);
-    const norm = (l) => normalizarLinea(l, id);
+    const norm = (l) => {
+      const n = normalizarLinea(l, id);
+      return epon ? n.replace(CANAL_RE, '$1{CANAL}') : n;
+    };
     const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm);
     const p = lines.filter(l => esLineaPri(l) && !EQUID_RE.test(l)).map(norm);
     auth.push(a);
     if (ponPort != null && key.startsWith(`${slot}/${ponPort}:`)) authPuerto.push(a);
     if (p.some(l => l.includes('{USER}'))) {
       pri.push(p);
-      if (modelo && equidDe(lines) === modelo) priModelo.push(p);
+      const mismo = delModelo ? delModelo.has(key) : (modelo && equidDe(lines) === modelo);
+      if (mismo) {
+        priModelo.push(p);
+        for (const l of lines) { const m = l.match(CANAL_RE); if (m) canales.set(m[2], (canales.get(m[2]) || 0) + 1); }
+      }
     }
   }
   const authFuente = authPuerto.filter(b => b.length).length ? 'puerto' : 'olt';
@@ -920,10 +939,14 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null } =
   // Con menos de 3 del mismo modelo no hay forma "mas comun" confiable: se usa la de
   // toda la OLT y se dice, para que la persona la revise.
   const priFuente = priModelo.length >= 3 ? 'modelo' : 'olt';
+  const canal = [...canales.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
   return {
     onus: blocks.size,
     auth: { ...authPlantilla, fuente: authFuente, estilo },
-    pri: { ...formaMasComun(priFuente === 'modelo' ? priModelo : pri), fuente: priFuente, modelo: modelo || null },
+    pri: {
+      ...formaMasComun(priFuente === 'modelo' ? priModelo : pri), fuente: priFuente, modelo: modelo || null,
+      ...(epon ? { valores: { CANAL: canal } } : {}),
+    },
   };
 }
 
@@ -931,7 +954,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null } =
 const VALOR_CLI_RE = /^[A-Za-z0-9_.@\-]+$/;
 
 function llenarPlantilla(lineas, valores) {
-  return lineas.map(l => l.replace(/\{(ID|SN|USER|PWD|SSID5|SSID|WIFIKEY)\}/g, (_, k) => {
+  return lineas.map(l => l.replace(/\{(ID|SN|USER|PWD|SSID5|SSID|WIFIKEY|CANAL)\}/g, (_, k) => {
     const v = valores[k];
     if (v == null || v === '') throw new Error(`Falta el valor ${k} para la plantilla`);
     return String(v);
@@ -954,7 +977,7 @@ async function guardarConfig(cli) {
 }
 
 /** Plantillas aprendidas de la OLT (solo lectura). */
-async function oltPlantilla(oltCfg, { ponPort = null, onuId = null } = {}) {
+async function oltPlantilla(oltCfg, { ponPort = null, onuId = null, modelo = null, mismoModelo = null } = {}) {
   const cli = new VsolCli(oltCfg);
   try {
     await cli.connect();
@@ -962,7 +985,7 @@ async function oltPlantilla(oltCfg, { ponPort = null, onuId = null } = {}) {
     const cfg = await cli.exec('show running-config', 60000);
     cli.close();
     const slot = parseInt(oltCfg.slot, 10) || 0;
-    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort, onuId }) };
+    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo }) };
   } catch (e) {
     cli.close();
     return { success: false, message: e.message || 'Error leyendo running-config' };
@@ -1046,7 +1069,7 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
  * Antes de escribir devuelve el respaldo: las lineas que esa ONU tenia, para
  * poder regresarlas. Con `dryRun` no escribe nada.
  */
-async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true }) {
+async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null }) {
   if (!ponPort || !onuId) return { success: false, message: 'Faltan ponPort y onuId' };
   // SSID de 5 GHz: solo lo usan los modelos doble banda; sin el, la misma red en las dos bandas
   ssid5 = ssid5 || ssid;
@@ -1064,7 +1087,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     await cli.connect();
     await cli.login();
     const cfg = await cli.exec('show running-config', 60000);
-    const plantilla = aprenderPlantillas(cfg, { slot, ponPort, onuId });
+    const plantilla = aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo });
     if (!plantilla.pri.lineas.length) {
       cli.close();
       return { success: false, message: 'La OLT no tiene ninguna ONU en modo router de la cual copiar la config' };
@@ -1074,7 +1097,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       cli.close();
       return { success: false, message: `No existe la ONU ${slot}/${ponPort}:${onuId} en la OLT (autorizala primero)` };
     }
-    const comandos = llenarPlantilla(plantilla.pri.lineas, { ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, SSID5: ssid5, WIFIKEY: wifiKey });
+    const comandos = llenarPlantilla(plantilla.pri.lineas, { ...(plantilla.pri.valores || {}), ID: onuId, USER: pppUser, PWD: pppPass, SSID: ssid, SSID5: ssid5, WIFIKEY: wifiKey });
     // Los `pri wan_adv` solo quedan en la OLT hasta el commit: sin el, el modem
     // sigue con su WAN de fabrica (tr069, VLAN 46). Es el "Submit" de la web.
     // Verificado en Tuxpan 2026-10-05 (`onu <id> pri wan_adv ?` lista `commit`).

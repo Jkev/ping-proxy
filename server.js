@@ -1755,6 +1755,7 @@ const server = http.createServer(async (req, res) => {
     '/olt/plantilla': (cfg, p) => oltPlantilla(cfg, {
       ponPort: p.ponPort ? parseInt(p.ponPort, 10) : null,
       onuId: p.onuId ? parseInt(p.onuId, 10) : null,
+      modelo: p.modelo || null, mismoModelo: Array.isArray(p.mismoModelo) ? p.mismoModelo : null,
     }),
     '/olt/authorize-aprendido': (cfg, p) => oltAuthorizeAprendido(cfg, {
       ponPort: parseInt(p.ponPort, 10), sn: p.sn, desc: p.desc, dryRun: p.dryRun === true, save: p.save !== false,
@@ -1763,6 +1764,7 @@ const server = http.createServer(async (req, res) => {
       ponPort: parseInt(p.ponPort, 10), onuId: parseInt(p.onuId, 10),
       pppUser: p.pppUser, pppPass: p.pppPass, ssid: p.ssid, ssid5: p.ssid5, wifiKey: p.wifiKey,
       dryRun: p.dryRun === true, save: p.save !== false,
+      modelo: p.modelo || null, mismoModelo: Array.isArray(p.mismoModelo) ? p.mismoModelo : null,
     }),
     // Diagnostico acotado a una ONU (ver olt-vsol.js): ayuda `?` y un comando `onu <id> pri ...`
     '/olt/ayuda': (cfg, p) => oltAyudaOnu(cfg, { ponPort: parseInt(p.ponPort, 10), consultas: Array.isArray(p.consultas) ? p.consultas : [] }),
