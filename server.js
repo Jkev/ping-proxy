@@ -3,7 +3,7 @@ const http = require('http');
 const { RouterOSAPI } = require('routeros');
 const cron = require('node-cron');
 const fetch = require('node-fetch');
-const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe, oltPlantilla, oltAuthorizeAprendido, oltConfigurarWan, oltAyudaOnu, oltComandoOnu } = require('./olt-vsol');
+const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe, oltPlantilla, oltAuthorizeAprendido, oltConfigurarWan, oltAyudaOnu, oltComandoOnu, oltConfigPuerto } = require('./olt-vsol');
 const { ucmStatus, ucmReboot } = require('./ucm-ssh');
 
 // Configuración
@@ -1767,6 +1767,8 @@ const server = http.createServer(async (req, res) => {
     // Diagnostico acotado a una ONU (ver olt-vsol.js): ayuda `?` y un comando `onu <id> pri ...`
     '/olt/ayuda': (cfg, p) => oltAyudaOnu(cfg, { ponPort: parseInt(p.ponPort, 10), consultas: Array.isArray(p.consultas) ? p.consultas : [] }),
     '/olt/onu-comando': (cfg, p) => oltComandoOnu(cfg, { ponPort: parseInt(p.ponPort, 10), onuId: p.onuId, comando: p.comando, save: p.save === true }),
+    // Solo lectura: config de un puerto, sin contrasenas ni claves
+    '/olt/config-puerto': (cfg, p) => oltConfigPuerto(cfg, { ponPort: parseInt(p.ponPort, 10), onuIds: Array.isArray(p.onuIds) ? p.onuIds : [] }),
   };
   if (req.method === 'POST' && RUTAS_ALTA[req.url]) {
     const authHeader = req.headers['authorization'];

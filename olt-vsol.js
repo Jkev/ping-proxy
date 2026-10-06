@@ -1048,7 +1048,10 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     if (!v || !VALOR_CLI_RE.test(String(v))) return { success: false, message: `${k} vacio o con caracteres que la OLT no acepta (solo letras, numeros, _ . @ -)` };
   }
   if (String(wifiKey).length < 8) return { success: false, message: 'La clave WiFi debe tener al menos 8 caracteres' };
-  if (isEpon(oltCfg.tec)) return { success: false, message: 'La config de modem en OLTs EPON aun no esta soportada' };
+  // EPON (Buenos Aires, 2026-10-06): la config `pri` es la misma que en GPON
+  // (wan_adv + commit, wifi_ssid, dhcp_server); solo cambia el contexto de la
+  // interfaz. Las ONUs EPON se registran solas (auth-mode disable): no hay
+  // autorizacion, el modem ya tiene id cuando se le manda esto.
   const slot = parseInt(oltCfg.slot, 10) || 0;
   const cli = new VsolCli(oltCfg);
   try {
@@ -1071,9 +1074,21 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     // Verificado en Tuxpan 2026-10-05 (`onu <id> pri wan_adv ?` lista `commit`).
     // El WiFi no tiene commit propio. No entra a la plantilla porque el
     // running-config no lo guarda.
-    if (comandos.some(l => /\bpri\s+wan_adv\b/i.test(l))) comandos.push(`onu ${onuId} pri wan_adv commit`);
+    // En EPON el running-config SI guarda la linea del commit (ya viene en la
+    // plantilla): no se manda dos veces.
+    const tieneCommit = (tipo) => comandos.some(l => new RegExp(`\\bpri\\s+${tipo}\\s+commit\\b`, 'i').test(l));
+    const plantillaConCommit = tieneCommit('wan_adv') || tieneCommit('wan_conn');
+    if (comandos.some(l => /\bpri\s+wan_adv\b/i.test(l)) && !tieneCommit('wan_adv')) comandos.push(`onu ${onuId} pri wan_adv commit`);
     // Modelos con la sintaxis vieja (`wan_conn`, p.ej. V342): su commit es otro (manual V1600D 17.6.13).
-    if (comandos.some(l => /\bpri\s+wan_conn\b/i.test(l))) comandos.push(`onu ${onuId} pri wan_conn commit`);
+    if (comandos.some(l => /\bpri\s+wan_conn\b/i.test(l)) && !tieneCommit('wan_conn')) comandos.push(`onu ${onuId} pri wan_conn commit`);
+    // EPON: el commit de la plantilla puede venir en medio de las wan_adv; se pasa
+    // despues de la ultima. GPON (commit agregado arriba, al final) queda igual.
+    if (plantillaConCommit) {
+      const commits = comandos.filter(l => /\bpri\s+wan_(adv|conn)\s+commit\b/i.test(l));
+      const sinCommit = comandos.filter(l => !commits.includes(l));
+      const ultimaWan = sinCommit.map(l => /\bpri\s+wan_(adv|conn)\b/i.test(l)).lastIndexOf(true);
+      comandos.splice(0, comandos.length, ...sinCommit.slice(0, ultimaWan + 1), ...commits, ...sinCommit.slice(ultimaWan + 1));
+    }
     const yaTeniaPri = respaldo.some(esLineaPri);
 
     if (dryRun) {
@@ -1081,7 +1096,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       return { success: true, dryRun: true, comandos, respaldo, yaTeniaPri, plantilla: plantilla.pri };
     }
 
-    await cli.exec(`interface gpon ${slot}/${ponPort}`);
+    await cli.exec(`interface ${interfaceKw(oltCfg.tec)} ${slot}/${ponPort}`);
     const enviados = [];
     try {
       for (const cmd of comandos) {
@@ -1097,7 +1112,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     cli.close();
     return {
       success: true, comandos: enviados, respaldo, yaTeniaPri, saved, plantilla: plantilla.pri,
-      message: `Config de modem enviada a GPON${slot}/${ponPort}:${onuId}${saved ? ' y guardada' : ' — ADVERTENCIA: no se pudo guardar la config'}`,
+      message: `Config de modem enviada a ${interfaceKw(oltCfg.tec).toUpperCase()}${slot}/${ponPort}:${onuId}${saved ? ' y guardada' : ' — ADVERTENCIA: no se pudo guardar la config'}`,
     };
   } catch (e) {
     cli.close();
@@ -1145,6 +1160,49 @@ async function oltAyudaOnu(oltCfg, { ponPort, consultas = [] }) {
   }
 }
 
+/** Quita lo secreto de una linea de config: contrasenas PPPoE, claves WiFi y cualquier password/key. */
+function sinSecretos(line) {
+  return line
+    .replace(/(\bpwd\s+)\S+/gi, '$1***')
+    .replace(/(\bshared_key\s+)\S+/gi, '$1***')
+    .replace(/(\b(?:password|passwd|key|secret)\s+)\S+/gi, '$1***');
+}
+
+/**
+ * Config de UN puerto PON tal cual esta en el running-config (solo lectura,
+ * sin secretos): las lineas del puerto (auth-mode, perfiles…) y las de cada ONU.
+ * Para estudiar en que varia la config entre ONUs (p.ej. por modelo en EPON,
+ * que no trae `pri equid`).
+ */
+async function oltConfigPuerto(oltCfg, { ponPort, onuIds = [] }) {
+  if (!ponPort) return { success: false, message: 'Falta ponPort' };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    const cfg = await cli.exec('show running-config', 60000);
+    cli.close();
+    const puerto = [];
+    let dentro = false;
+    for (const raw of stripAnsi(cfg).split('\n')) {
+      const line = raw.trim();
+      const ctx = line.match(/^interface\s+[ge]pon\s+(\d+)\/(\d+)/i);
+      if (ctx) { dentro = parseInt(ctx[1], 10) === slot && parseInt(ctx[2], 10) === ponPort; continue; }
+      if (/^(interface|exit)\b/i.test(line)) { dentro = false; continue; }
+      if (dentro && line) puerto.push(sinSecretos(line));
+    }
+    const filtro = new Set(onuIds.map(n => parseInt(n, 10)).filter(Boolean));
+    const lineas = filtro.size
+      ? puerto.filter(l => { const m = l.match(/^onu\s+(?:add\s+)?(\d+)\b/i); return !m || filtro.has(parseInt(m[1], 10)); })
+      : puerto;
+    return { success: true, lineas: lineas.slice(0, 5000), total: lineas.length };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error leyendo la config' };
+  }
+}
+
 async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) {
   const id = parseInt(onuId, 10);
   const cmd = String(comando || '').trim();
@@ -1175,7 +1233,7 @@ async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) 
 module.exports = {
   VsolCli,
   oltAyudaOnu,
-  oltComandoOnu,
+  oltComandoOnu, oltConfigPuerto,
   parseOnuBlocks,
   aprenderPlantillas,
   oltPlantilla,
