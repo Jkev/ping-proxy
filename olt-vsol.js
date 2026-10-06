@@ -938,7 +938,9 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
       }
     }
   }
-  const authFuente = authPuerto.filter(b => b.length).length ? 'puerto' : 'olt';
+  // Con menos de 3 ONUs en el puerto no hay forma "mas comun": la de toda la OLT
+  // (Palma Real 2026-10-06: el puerto 8 tenia 2 ONUs de formas distintas).
+  const authFuente = authPuerto.filter(b => b.length).length >= 3 ? 'puerto' : 'olt';
   const authPlantilla = formaMasComun(authFuente === 'puerto' ? authPuerto : auth);
   const estilo = authPlantilla.lineas.some(l => /\bprofile\s+line\b/i.test(l)) ? 'perfiles' : 'bloque';
   // Con menos de 3 del mismo modelo no hay forma "mas comun" confiable: se usa la de
@@ -1043,12 +1045,39 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
       return { success: false, message: 'La plantilla aprendida no trae la linea `onu add`: revisar la OLT a mano', plantilla: plantilla.auth };
     }
 
+    // `portid N` es propio de cada ONU (145, 161, 163… en Palma Real): una forma que lo
+    // trae no se puede copiar a otra ONU.
+    if (plantilla.auth.lineas.some(l => /\bportid\s+\d+/i.test(l))) {
+      cli.close();
+      return { success: false, message: 'La forma de autorizar trae un portid propio de cada ONU: no se puede copiar, autorizar a mano', plantilla: plantilla.auth };
+    }
+
     await cli.exec(`interface gpon ${slot}/${ponPort}`);
     const existing = parseOnuInfo(await cli.exec('show onu info'));
     const dup = existing.find(o => o.sn && o.sn.toLowerCase() === sn.toLowerCase());
     if (dup) {
+      // Ya existe (p.ej. la OLT la autorizo sola), pero a veces solo con `onu add … profile
+      // default` y sin VLAN/servicio: el PPPoE nunca llega al router (CILK, Palma Real
+      // 2026-10-06). Se le agregan las lineas de la plantilla que le falten.
+      const tiene = new Set((parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${dup.onuId}`) || []).map(l => l.trim().toLowerCase()));
+      const faltan = llenarPlantilla(plantilla.auth.lineas, { ID: dup.onuId, SN: sn })
+        .filter(l => !/^onu\s+add\b/i.test(l) && !tiene.has(l.trim().toLowerCase()));
+      if (!faltan.length || dryRun) {
+        cli.close();
+        return {
+          success: true, alreadyExists: true, onuId: dup.onuId, ponPort, sn, plantilla: plantilla.auth, ...(dryRun ? { dryRun: true, comandos: faltan } : {}),
+          message: faltan.length ? `La ONU ${sn} existe como ${pon}:${dup.onuId}; le faltan ${faltan.length} linea(s) de autorizacion` : `La ONU ${sn} ya estaba autorizada como ${pon}:${dup.onuId}`,
+        };
+      }
+      const enviados = [];
+      for (const cmd of faltan) { await execEstricto(cli, cmd); enviados.push(cmd); }
+      let saved = false;
+      if (save) { await cli.exec('exit'); saved = await guardarConfig(cli); }
       cli.close();
-      return { success: true, alreadyExists: true, onuId: dup.onuId, ponPort, sn, plantilla: plantilla.auth, message: `La ONU ${sn} ya estaba autorizada como ${pon}:${dup.onuId}` };
+      return {
+        success: true, alreadyExists: true, completada: true, onuId: dup.onuId, ponPort, sn, saved, comandos: enviados, plantilla: plantilla.auth,
+        message: `La ONU ${sn} ya existia como ${pon}:${dup.onuId}; se le agregaron ${enviados.length} linea(s) de autorizacion${saved ? ' y se guardo' : ''}`,
+      };
     }
     const used = new Set(existing.map(o => o.onuId));
     let onuId = 1;
