@@ -893,8 +893,13 @@ function formaMasComun(bloques) {
  */
 const EQUID_RE = /^onu\s+\d+\s+pri\s+equid\s+(\S+)/i;
 
-/** Canal WiFi de una linea `pri wifi_switch enable etsi 6 ...` (EPON). */
+/**
+ * Canal WiFi de 2.4 GHz de una linea `pri wifi_switch enable etsi 6 ...` (EPON).
+ * Solo `wifi_switch`: la radio de 5 GHz (`wifi1_switch`) usa otros canales (36…)
+ * y llenarla con el mas comun de 2.4 GHz la dejaria en un canal invalido.
+ */
 const CANAL_RE = /(\b(?:etsi|fcc)\s+)(\d+)\b/i;
+const esLineaWifi24 = (l) => /\bpri\s+wifi_switch\b/i.test(l);
 
 /**
  * EPON (Buenos Aires 2026-10-06): no hay `pri equid`; el modelo lo da el que llama
@@ -918,7 +923,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
     const id = parseInt(key.split(':')[1], 10);
     const norm = (l) => {
       const n = normalizarLinea(l, id);
-      return epon ? n.replace(CANAL_RE, '$1{CANAL}') : n;
+      return epon && esLineaWifi24(n) ? n.replace(CANAL_RE, '$1{CANAL}') : n;
     };
     const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm);
     const p = lines.filter(l => esLineaPri(l) && !EQUID_RE.test(l)).map(norm);
@@ -929,7 +934,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
       const mismo = delModelo ? delModelo.has(key) : (modelo && equidDe(lines) === modelo);
       if (mismo) {
         priModelo.push(p);
-        for (const l of lines) { const m = l.match(CANAL_RE); if (m) canales.set(m[2], (canales.get(m[2]) || 0) + 1); }
+        for (const l of lines) { const m = esLineaWifi24(l) && l.match(CANAL_RE); if (m) canales.set(m[2], (canales.get(m[2]) || 0) + 1); }
       }
     }
   }
