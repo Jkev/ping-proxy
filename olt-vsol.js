@@ -435,7 +435,7 @@ function parseRunningConfig(output) {
     const key = `${curPort}:${onuId}`;
     let rec = byKey.get(key);
     if (!rec) {
-      rec = { slot: curSlot, port: curPort, onuId, sn: null, desc: null, pppoeUser: null, pppoePwd: null, mode: 'bridge' };
+      rec = { slot: curSlot, port: curPort, onuId, sn: null, mac: null, desc: null, pppoeUser: null, pppoePwd: null, mode: 'bridge' };
       byKey.set(key, rec);
     }
     return rec;
@@ -452,6 +452,12 @@ function parseRunningConfig(output) {
     // onu add <id> profile default sn <SN>
     if ((m = line.match(/^onu\s+add\s+(\d+)\b.*\bsn\s+([A-Za-z0-9]+)/i))) {
       ensure(parseInt(m[1], 10)).sn = m[2];
+      continue;
+    }
+    // EPON: la ONU se registra sola y la OLT escribe a nivel de puerto
+    // `confirm onu mac <mac> onuid <id>` (Buenos Aires 2026-10-06): es su "SN".
+    if ((m = line.match(/^confirm\s+onu\s+mac\s+([0-9a-f:]{17})\s+onuid\s+(\d+)/i))) {
+      ensure(parseInt(m[2], 10)).mac = m[1].toUpperCase();
       continue;
     }
     // onu <id> desc <texto>
@@ -1203,6 +1209,37 @@ async function oltConfigPuerto(oltCfg, { ponPort, onuIds = [] }) {
   }
 }
 
+/**
+ * Consultas `show` de solo lectura sobre el modelo/version de las ONUs de un
+ * puerto (EPON no trae `pri equid` en el running-config). Lista cerrada: nada
+ * de WiFi ni WAN, que traen claves.
+ */
+const SHOW_ONU_RE = /^show onu (basic-info( all)?|\d+ ctc (onu_info|ctc_info|onu_sn|fw_ver|chip_id)|\d+ pri (onu_ver|support_info|onu_mode))$/i;
+
+async function oltShowOnu(oltCfg, { ponPort, comandos = [] }) {
+  if (!ponPort || !comandos.length) return { success: false, message: 'Faltan ponPort y comandos' };
+  const malos = comandos.filter(c => !SHOW_ONU_RE.test(String(c).trim()));
+  if (malos.length) return { success: false, message: `Solo consultas de modelo/version: ${malos.join(' | ')}` };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    await cli.exec(`interface ${interfaceKw(oltCfg.tec)} ${slot}/${ponPort}`);
+    const salidas = [];
+    for (const c of comandos.slice(0, 20)) {
+      let salida = '';
+      try { salida = await cli.exec(String(c).trim(), 60000); } catch (e) { salida = `ERROR: ${e.message}`; }
+      salidas.push({ comando: c, salida: stripAnsi(salida).split('\n').map(sinSecretos).join('\n').trim().slice(0, 30000) });
+    }
+    cli.close();
+    return { success: true, salidas };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error consultando la OLT' };
+  }
+}
+
 async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) {
   const id = parseInt(onuId, 10);
   const cmd = String(comando || '').trim();
@@ -1233,7 +1270,7 @@ async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) 
 module.exports = {
   VsolCli,
   oltAyudaOnu,
-  oltComandoOnu, oltConfigPuerto,
+  oltComandoOnu, oltConfigPuerto, oltShowOnu,
   parseOnuBlocks,
   aprenderPlantillas,
   oltPlantilla,
