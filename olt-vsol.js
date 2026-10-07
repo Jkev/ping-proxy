@@ -901,6 +901,62 @@ const EQUID_RE = /^onu\s+\d+\s+pri\s+equid\s+(\S+)/i;
 const CANAL_RE = /(\b(?:etsi|fcc)\s+)(\d+)\b/i;
 const esLineaWifi24 = (l) => /\bpri\s+wifi_switch\b/i.test(l);
 
+/** Coincidencia minima para mandar una forma de autorizar sin una persona (igual que el panel). */
+const MIN_COINCIDENCIA_AUTH = 0.8;
+const VSOL_SN_RE = /\bsn\s+(?:VSOL|GPON|MONU)[0-9A-F]{8}\b/i;
+/** Bloque de una ONU V-SOL: SN de V-SOL, o con `pri` (otra marca en bridge no lleva `pri`). */
+const esBloqueVsol = (lines) => lines.some(l => VSOL_SN_RE.test(l) || esLineaPri(l));
+const formaClara = (f) => f.total > 0 && f.coinciden >= 2 && f.coinciden / f.total >= MIN_COINCIDENCIA_AUTH;
+
+/**
+ * La forma de autorizar es la misma en todo el puerto (y casi siempre en toda la OLT);
+ * las ONUs distintas suelen ser de otra marca en bridge (PING/HWTC) o viejas. Cazones 1
+ * puerto 8 (2026-10-07): 2 V-SOL con `vlan_1010`/`srv_1010` y un PING con otra forma = 2/3,
+ * debajo del 80%, y la activacion se detenia. Orden con >=3 ONUs en el puerto:
+ *   1. la del puerto, si llega al umbral                            → 'puerto'
+ *   2. la de las V-SOL del puerto, si entre ellas es clara          → 'puerto_vsol'
+ *   3. la mas comun de la OLT (todas, o solo V-SOL), si llega       → 'olt'
+ *   4. puerto de <=4 ONUs cuya forma es la mas comun de la OLT      → 'puerto_olt'
+ *   5. si no, la del puerto tal cual (el panel se detiene)          → 'puerto'
+ * Con menos de 3 en el puerto, la de la OLT como antes (Palma Real 2026-10-06), o la de
+ * sus V-SOL si la de todas no es clara.
+ * Las fuentes nuevas traen `detalle` con de donde salio; `coinciden/total` son los del
+ * grupo de donde salio (salvo 'puerto_olt', que el panel acepta por su fuente).
+ */
+function elegirFormaAuth(authPuerto, auth) {
+  const conLineas = (bs) => bs.filter(b => b.length);
+  const puerto = conLineas(authPuerto);
+  const todas = conLineas(auth);
+  const fOlt = formaMasComun(todas);
+  const fOltVsol = formaMasComun(todas.filter(b => b.vsol));
+  const deOlt = (motivo) => {
+    if (formaClara(fOlt) || !formaClara(fOltVsol)) return { plantilla: fOlt, fuente: 'olt', detalle: motivo && formaClara(fOlt) ? `forma mas comun de la OLT (${fOlt.coinciden} de ${fOlt.total} ONUs); ${motivo}` : null };
+    return { plantilla: fOltVsol, fuente: 'olt', detalle: `forma mas comun de la OLT entre sus ONUs V-SOL (${fOltVsol.coinciden} de ${fOltVsol.total})${motivo ? `; ${motivo}` : ''}` };
+  };
+  if (puerto.length < 3) return deOlt(null);
+  const fPuerto = formaMasComun(puerto);
+  if (formaClara(fPuerto)) return { plantilla: fPuerto, fuente: 'puerto', detalle: null };
+
+  const vsolPuerto = puerto.filter(b => b.vsol);
+  const fVsol = formaMasComun(vsolPuerto);
+  if (vsolPuerto.length < puerto.length && formaClara(fVsol)) {
+    const otras = puerto.length - vsolPuerto.length;
+    return {
+      plantilla: fVsol, fuente: 'puerto_vsol',
+      detalle: `forma de las ONUs V-SOL del puerto (${fVsol.coinciden} de ${fVsol.total}; ${otras} de otra marca ignorada${otras === 1 ? '' : 's'})`,
+    };
+  }
+  if (formaClara(fOlt) || formaClara(fOltVsol)) return deOlt(`la del puerto no era clara (${fPuerto.coinciden} de ${fPuerto.total})`);
+  const misma = (a, b) => a.lineas.length > 0 && a.lineas.join('\n') === b.lineas.join('\n');
+  if (puerto.length <= 4 && (misma(fPuerto, fOlt) || misma(fPuerto, fOltVsol))) {
+    return {
+      plantilla: fPuerto, fuente: 'puerto_olt',
+      detalle: `forma del puerto (${fPuerto.coinciden} de ${fPuerto.total}), que es la mas comun de la OLT`,
+    };
+  }
+  return { plantilla: fPuerto, fuente: 'puerto', detalle: null };
+}
+
 /**
  * EPON (Buenos Aires 2026-10-06): no hay `pri equid`; el modelo lo da el que llama
  * (`modelo` + `mismoModelo`: llaves "slot/puerto:onu" de las ONUs de ese modelo,
@@ -927,6 +983,9 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
     };
     const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm);
     const p = lines.filter(l => esLineaPri(l) && !EQUID_RE.test(l)).map(norm);
+    // V-SOL = SN de V-SOL (VSOL/GPON/MONU) o con config `pri`: las de otra marca van en
+    // bridge y la OLT no les escribe `pri`. Se marca en el propio arreglo.
+    a.vsol = esBloqueVsol(lines);
     auth.push(a);
     if (ponPort != null && key.startsWith(`${slot}/${ponPort}:`)) authPuerto.push(a);
     if (p.some(l => l.includes('{USER}'))) {
@@ -938,10 +997,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
       }
     }
   }
-  // Con menos de 3 ONUs en el puerto no hay forma "mas comun": la de toda la OLT
-  // (Palma Real 2026-10-06: el puerto 8 tenia 2 ONUs de formas distintas).
-  const authFuente = authPuerto.filter(b => b.length).length >= 3 ? 'puerto' : 'olt';
-  const authPlantilla = formaMasComun(authFuente === 'puerto' ? authPuerto : auth);
+  const { plantilla: authPlantilla, fuente: authFuente, detalle: authDetalle } = elegirFormaAuth(authPuerto, auth);
   const estilo = authPlantilla.lineas.some(l => /\bprofile\s+line\b/i.test(l)) ? 'perfiles' : 'bloque';
   // Con menos de 3 del mismo modelo no hay forma "mas comun" confiable: se usa la de
   // toda la OLT y se dice, para que la persona la revise.
@@ -949,7 +1005,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
   const canal = [...canales.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
   return {
     onus: blocks.size,
-    auth: { ...authPlantilla, fuente: authFuente, estilo },
+    auth: { ...authPlantilla, fuente: authFuente, estilo, ...(authDetalle ? { detalle: authDetalle } : {}) },
     pri: {
       ...formaMasComun(priFuente === 'modelo' ? priModelo : pri), fuente: priFuente, modelo: modelo || null,
       ...(epon ? { valores: { CANAL: canal } } : {}),
