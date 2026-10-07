@@ -490,6 +490,17 @@ function sanitizeDesc(desc) {
     .slice(0, 32) || 'Sin_Nombre';
 }
 
+/**
+ * ¿El ultimo `interface gpon|epon s/p` entro al puerto? Si el puerto no existe la
+ * OLT se queda en `(config)#` (verificado en Coyutla 3, V2.2.8R: "the gpon
+ * interface's portno is out of range."). El prompt del puerto es `(config-pon-0/1)`
+ * en GPON y cambia en EPON, asi que solo se descarta el `(config)` pelon.
+ */
+function enContextoDePuerto(buffer) {
+  const tail = stripAsyncEvents(stripAnsi(buffer)).trimEnd();
+  return !/\(config\)#$/.test(tail);
+}
+
 // ==================== OPERACIONES ====================
 
 /**
@@ -509,9 +520,25 @@ async function oltAutoFind(oltCfg, ponPorts = null) {
     // Lo que la OLT imprimio y no se reconocio como ONU: si el resultado sale
     // vacio, esto dice si de verdad no hay nada o si el formato cambio.
     const sinReconocer = [];
+    // Puertos que la OLT no tiene (Coyutla 3 es de 8 PON y su doc decia 16): la OLT
+    // contesta "portno is out of range" y se queda en `(config)#`; mandar ahi
+    // `show onu auto-find` fallaba como "no reconoce el comando" y tumbaba toda la OLT.
+    const puertosInexistentes = [];
     for (const p of ports) {
       await cli.exec(`interface ${kw} ${slot}/${p}`);
-      const out = await cli.exec('show onu auto-find', 30000);
+      if (!enContextoDePuerto(cli.buffer)) { puertosInexistentes.push(p); continue; }
+      let out;
+      try {
+        out = await cli.exec('show onu auto-find', 30000);
+      } catch (e) {
+        // Dentro del puerto y aun asi sin auto-find: otro dialecto, no una OLT muda
+        // (el panel no la reintenta ni la cuenta como "no respondio").
+        if (/no reconoce el comando/i.test((e && e.message) || '')) {
+          cli.close();
+          return { success: false, codigo: 'autofind_no_soportado', message: e.message, onus: [] };
+        }
+        throw e;
+      }
       const onus = parseAutoFind(out, p);
       found.push(...onus);
       if (!onus.length) {
@@ -521,7 +548,11 @@ async function oltAutoFind(oltCfg, ponPorts = null) {
       await cli.exec('exit');
     }
     cli.close();
-    return { success: true, onus: found, ...(found.length ? {} : { sinReconocer }) };
+    return {
+      success: true, onus: found,
+      ...(found.length ? {} : { sinReconocer }),
+      ...(puertosInexistentes.length ? { puertosInexistentes } : {}),
+    };
   } catch (e) {
     cli.close();
     return { success: false, message: e.message || 'Error en auto-find', onus: [] };
