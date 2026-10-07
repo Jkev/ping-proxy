@@ -1759,12 +1759,16 @@ const server = http.createServer(async (req, res) => {
     }),
     '/olt/authorize-aprendido': (cfg, p) => oltAuthorizeAprendido(cfg, {
       ponPort: parseInt(p.ponPort, 10), sn: p.sn, desc: p.desc, dryRun: p.dryRun === true, save: p.save !== false,
+      // OLT sin ONUs: forma de otra OLT del mismo router (el proxy revisa que sus perfiles existan aqui)
+      plantillaAuth: p.plantillaAuth && typeof p.plantillaAuth === 'object' ? p.plantillaAuth : null,
     }),
     '/olt/onu-wan': (cfg, p) => oltConfigurarWan(cfg, {
       ponPort: parseInt(p.ponPort, 10), onuId: parseInt(p.onuId, 10),
       pppUser: p.pppUser, pppPass: p.pppPass, ssid: p.ssid, ssid5: p.ssid5, wifiKey: p.wifiKey,
       dryRun: p.dryRun === true, save: p.save !== false,
       modelo: p.modelo || null, mismoModelo: Array.isArray(p.mismoModelo) ? p.mismoModelo : null,
+      // OLT con menos de 3 modems del modelo: plantilla prestada de una OLT hermana o del parque
+      plantillaPri: p.plantillaPri && typeof p.plantillaPri === 'object' ? p.plantillaPri : null,
     }),
     // Diagnostico acotado a una ONU (ver olt-vsol.js): ayuda `?` y un comando `onu <id> pri ...`
     '/olt/ayuda': (cfg, p) => oltAyudaOnu(cfg, { ponPort: parseInt(p.ponPort, 10), consultas: Array.isArray(p.consultas) ? p.consultas : [] }),

@@ -977,6 +977,145 @@ function lineaRadio24(output, onuId) {
   return `onu ${onuId} pri wifi_switch enable ${region} 0 ${modo}`;
 }
 
+// ==================== OLT SIN DE QUE APRENDER (OLT nueva o casi vacia) ====================
+// Pantepec 2 (alta 2026-10-07) no tenia ninguna ONU: no habia forma de autorizar ni
+// config de modem que copiar. Decision de Jonathan: intentarlo igual con un respaldo y,
+// si la OLT lo rechaza, detenerse como siempre (el riesgo es solo ese cliente).
+//   - autorizar: 1) los perfiles que la OLT define aunque nadie los use; 2) la forma de
+//     otra OLT del mismo router que manda el panel (`plantillaAuth`), solo si los perfiles
+//     que nombra existen en esta OLT.
+//   - modem: la plantilla `pri` que manda el panel (`plantillaPri`, de una OLT hermana o
+//     del parque), con la VLAN de la WAN cambiada a la de esta OLT si se puede leer.
+
+/**
+ * Perfiles definidos en el running-config, se usen o no:
+ *   profile line id 1 name line_1010 / tcont 1 dba dba_1010 / ... service-port 1 gemport 1 uservlan 1010 vlan 1010
+ *   profile srv id 1 name srv_1010
+ *   profile dba id 1 name dba_1010
+ * Cada perfil de linea trae las VLAN que nombra (para saber la VLAN de servicio).
+ */
+function perfilesDefinidos(output) {
+  const res = { line: [], srv: [], dba: [] };
+  let actual = null;
+  for (const raw of stripAnsi(output).split('\n')) {
+    const line = raw.trim();
+    const m = line.match(/^profile\s+(line|srv|dba)\s+id\s+(\d+)\s+name\s+(\S+)/i);
+    if (m) {
+      actual = { id: parseInt(m[2], 10), name: m[3], vlans: [] };
+      res[m[1].toLowerCase()].push(actual);
+      continue;
+    }
+    if (!actual) continue;
+    if (/^(exit|!|interface\b|profile\b)/i.test(line)) { actual = null; continue; }
+    for (const v of line.matchAll(/\b(?:uservlan|vlan)\s+(\d+)\b/gi)) {
+      const n = parseInt(v[1], 10);
+      if (!actual.vlans.includes(n)) actual.vlans.push(n);
+    }
+  }
+  return res;
+}
+
+const esPerfilDeFabrica = (name) => /^default/i.test(name);
+const numerosDe = (name) => (String(name).match(/\d{2,}/g) || []);
+
+/**
+ * Forma de autorizar con los perfiles line/srv de la propia OLT (sin ONUs que la usen).
+ * Exactamente un par line/srv (sin contar los `default…` de fabrica), o, si hay varios,
+ * el unico par cuyos nombres llevan el mismo numero de VLAN (`VLAN1010` / `srv_1010`).
+ * null si no hay un par claro.
+ */
+function authDePerfilesPropios(output) {
+  const p = perfilesDefinidos(output);
+  const lines = p.line.filter(x => !esPerfilDeFabrica(x.name));
+  const srvs = p.srv.filter(x => !esPerfilDeFabrica(x.name));
+  if (!lines.length || !srvs.length) return null;
+  let par = null;
+  if (lines.length === 1 && srvs.length === 1) par = [lines[0], srvs[0]];
+  else {
+    const pares = [];
+    for (const l of lines) for (const s of srvs) {
+      if (numerosDe(l.name).some(n => numerosDe(s.name).includes(n))) pares.push([l, s]);
+    }
+    if (pares.length === 1) par = pares[0];
+  }
+  if (!par) return null;
+  return {
+    lineas: ['onu add {ID} profile default sn {SN}', `onu {ID} profile line name ${par[0].name}`, `onu {ID} profile srv name ${par[1].name}`],
+    coinciden: 0, total: 0, variantes: 0,
+    fuente: 'perfiles_olt', estilo: 'perfiles',
+    detalle: `perfiles definidos en la OLT sin ONUs que los usen (${par[0].name} / ${par[1].name})`,
+  };
+}
+
+/**
+ * Perfiles que una forma de autorizar nombra y que NO existen en esta OLT
+ * (`profile line name X`, `profile srv name Y`, `tcont N dba Z`). Vacio = se puede copiar.
+ */
+function perfilesQueFaltan(lineas, output) {
+  const p = perfilesDefinidos(output);
+  const hay = (tipo, n) => p[tipo].some(x => x.name === n);
+  const vlans = vlansDeclaradas(output);
+  const faltan = [];
+  for (const l of lineas) {
+    const pl = l.match(/\bprofile\s+(line|srv)\s+name\s+(\S+)/i);
+    if (pl && !hay(pl[1].toLowerCase(), pl[2])) faltan.push(`${pl[1].toLowerCase()} ${pl[2]}`);
+    const dba = l.match(/\bdba\s+(\S+)/i);
+    if (dba && !hay('dba', dba[1])) faltan.push(`dba ${dba[1]}`);
+    // estilo bloque: la VLAN del servicio tiene que existir en esta OLT
+    for (const v of l.matchAll(/\b(?:uservlan|vlan)\s+(\d+)\b/gi)) {
+      if (!vlans.has(parseInt(v[1], 10))) faltan.push(`vlan ${v[1]}`);
+    }
+  }
+  return [...new Set(faltan)];
+}
+
+/** VLANs declaradas a nivel global (`vlan 1`, `vlan 1010 - 1011`, `vlan 1020`). */
+function vlansDeclaradas(output) {
+  const res = new Set();
+  for (const raw of stripAnsi(output).split('\n')) {
+    const m = raw.trim().match(/^vlan\s+([\d\s,\-]+)$/i);
+    if (!m) continue;
+    for (const parte of m[1].split(',')) {
+      const r = parte.trim().match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+      if (!r) continue;
+      const a = parseInt(r[1], 10), b = r[2] ? parseInt(r[2], 10) : a;
+      for (let v = a; v <= b && v - a < 4096; v++) res.add(v);
+    }
+  }
+  return res;
+}
+
+/** Lineas de una plantilla que llega del panel: solo `onu …` con los marcadores conocidos. */
+function plantillaValida(lineas, re) {
+  return Array.isArray(lineas) && lineas.length > 0 && lineas.length <= 40
+    && lineas.every(l => typeof l === 'string' && re.test(l) && !/[\r\n;|?]/.test(l)
+      && (l.match(/\{[A-Z0-9]+\}/g) || []).every(k => /^\{(ID|SN|USER|PWD|SSID5|SSID|WIFIKEY)\}$/.test(k)));
+}
+const AUTH_PRESTADA_RE = /^onu\s+(add\s+)?\{ID\}\s/i;
+const PRI_PRESTADA_RE = /^onu\s+\{ID\}\s+pri\s/i;
+
+/**
+ * VLAN de servicio de una ONU de esta OLT: la del perfil de linea que usa o la de su
+ * `service-port`. Sin ONU (o sin dato), la unica VLAN de los perfiles de linea de la OLT.
+ * null si no hay una sola.
+ */
+function vlanDeServicio(output, bloqueOnu) {
+  const p = perfilesDefinidos(output);
+  const unica = (arr) => { const s = [...new Set(arr)]; return s.length === 1 ? s[0] : null; };
+  if (bloqueOnu && bloqueOnu.length) {
+    const vlans = [];
+    for (const l of bloqueOnu) {
+      const pl = l.match(/\bprofile\s+line\s+name\s+(\S+)/i);
+      if (pl) vlans.push(...((p.line.find(x => x.name === pl[1]) || {}).vlans || []));
+      const sp = l.match(/\bservice-port\b.*\bvlan\s+(\d+)\b/i);
+      if (sp) vlans.push(parseInt(sp[1], 10));
+    }
+    const v = unica(vlans);
+    if (v != null) return v;
+  }
+  return unica(p.line.filter(x => !esPerfilDeFabrica(x.name)).flatMap(x => x.vlans));
+}
+
 /** Valores que van pegados al CLI: sin espacios ni nada que la OLT pueda leer como otro argumento. */
 const VALOR_CLI_RE = /^[A-Za-z0-9_.@\-]+$/;
 
@@ -1012,7 +1151,8 @@ async function oltPlantilla(oltCfg, { ponPort = null, onuId = null, modelo = nul
     const cfg = await cli.exec('show running-config', 120000);
     cli.close();
     const slot = parseInt(oltCfg.slot, 10) || 0;
-    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo }) };
+    // radio24: la linea de radio 2.4 GHz mas comun ({ID}), para prestarla a una OLT sin ONUs
+    return { success: true, ...aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo }), radio24: lineaRadio24(cfg, '{ID}') };
   } catch (e) {
     cli.close();
     return { success: false, message: e.message || 'Error leyendo running-config' };
@@ -1024,7 +1164,7 @@ async function oltPlantilla(oltCfg, { ponPort = null, onuId = null, modelo = nul
  * Idempotente por SN. Con `dryRun` solo lee (show onu info + running-config)
  * y devuelve los comandos que mandaria.
  */
-async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false, save = true }) {
+async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false, save = true, plantillaAuth = null }) {
   if (!ponPort || !sn) return { success: false, message: 'Faltan ponPort y sn' };
   if (!VALOR_CLI_RE.test(sn)) return { success: false, message: `SN invalido: "${sn}"` };
   if (isEpon(oltCfg.tec)) return { success: false, message: 'La autorizacion automatica en OLTs EPON aun no esta soportada' };
@@ -1036,9 +1176,28 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
     await cli.login();
     const cfg = await cli.exec('show running-config', 120000);
     const plantilla = aprenderPlantillas(cfg, { slot, ponPort });
+    // OLT sin ONUs (nueva o casi vacia): 1) sus propios perfiles line/srv, 2) la forma de
+    // otra OLT del mismo router que manda el panel, si los perfiles que nombra existen aqui.
     if (!plantilla.auth.lineas.length) {
-      cli.close();
-      return { success: false, message: 'La OLT no tiene ninguna ONU de la cual copiar la autorizacion' };
+      const propios = authDePerfilesPropios(cfg);
+      let motivo = 'La OLT no tiene ninguna ONU de la cual copiar la autorizacion';
+      if (propios) plantilla.auth = propios;
+      else if (plantillaAuth && plantillaValida(plantillaAuth.lineas, AUTH_PRESTADA_RE)) {
+        const faltan = perfilesQueFaltan(plantillaAuth.lineas, cfg);
+        const de = String(plantillaAuth.de || 'otra OLT').slice(0, 80);
+        if (!faltan.length) {
+          plantilla.auth = {
+            lineas: plantillaAuth.lineas.slice(), coinciden: 0, total: 0, variantes: 0,
+            fuente: 'prestada', de,
+            estilo: plantillaAuth.lineas.some(l => /\bprofile\s+line\b/i.test(l)) ? 'perfiles' : 'bloque',
+            detalle: `forma de autorizar prestada de ${de}`,
+          };
+        } else motivo += ` ni un par claro de perfiles propios, y la forma de ${de} usa perfiles que esta OLT no tiene (${faltan.join(', ')})`;
+      } else motivo += ' ni un par claro de perfiles line/srv propios';
+      if (!plantilla.auth.lineas.length) {
+        cli.close();
+        return { success: false, sinOnus: true, message: motivo };
+      }
     }
     if (!plantilla.auth.lineas.some(l => /^onu add \{ID\}/.test(l))) {
       cli.close();
@@ -1123,7 +1282,7 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
  * Antes de escribir devuelve el respaldo: las lineas que esa ONU tenia, para
  * poder regresarlas. Con `dryRun` no escribe nada.
  */
-async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null }) {
+async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null, plantillaPri = null }) {
   if (!ponPort || !onuId) return { success: false, message: 'Faltan ponPort y onuId' };
   // SSID de 5 GHz: solo lo usan los modelos doble banda; sin el, la misma red en las dos bandas
   ssid5 = ssid5 || ssid;
@@ -1142,11 +1301,33 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     await cli.login();
     const cfg = await cli.exec('show running-config', 120000);
     const plantilla = aprenderPlantillas(cfg, { slot, ponPort, onuId, tec: oltCfg.tec, modelo, mismoModelo });
+    const respaldo = parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${onuId}`) || [];
+    // OLT con menos de 3 modems de este modelo (nueva o casi vacia, GPON): la plantilla
+    // que manda el panel, de otra OLT del mismo router o del parque. La VLAN de la WAN
+    // se cambia por la de esta OLT si se puede leer; si no, se queda la de la fuente y se dice.
+    let radio24Prestado = null;
+    if (plantilla.pri.fuente !== 'modelo' && !isEpon(oltCfg.tec) && plantillaPri && plantillaValida(plantillaPri.lineas, PRI_PRESTADA_RE)) {
+      const de = String(plantillaPri.de || 'otra OLT').slice(0, 80);
+      const vlan = vlanDeServicio(cfg, respaldo);
+      const vlanFuente = plantillaPri.lineas.map(l => l.match(/\bwan_vlan\s+(\d+)\b/i)).find(Boolean)?.[1] || null;
+      const lineas = vlan != null ? plantillaPri.lineas.map(l => l.replace(/(\bwan_vlan\s+)\d+\b/i, `$1${vlan}`)) : plantillaPri.lineas.slice();
+      const vlanNota = !vlanFuente ? null
+        : vlan == null ? `no se pudo leer la VLAN de esta OLT: se deja la de la fuente, ${vlanFuente}`
+          : String(vlan) === vlanFuente ? `VLAN ${vlan}, igual en las dos OLTs` : `VLAN ${vlanFuente} de la fuente cambiada por ${vlan} de esta OLT`;
+      plantilla.pri = {
+        lineas, coinciden: Number(plantillaPri.coinciden) || 0, total: Number(plantillaPri.total) || 0, variantes: Number(plantillaPri.variantes) || 0,
+        fuente: 'prestada', de, modelo: plantilla.pri.modelo || plantillaPri.modelo || null,
+        modeloFuente: plantillaPri.modeloFuente || null, vlan: vlan != null ? vlan : (vlanFuente ? Number(vlanFuente) : null), vlanNota,
+        detalle: `plantilla prestada de ${de}${vlanNota ? `; ${vlanNota}` : ''}`,
+      };
+      if (typeof plantillaPri.radio24 === 'string' && /^onu\s+\{ID\}\s+pri\s+wifi_switch\s+enable\s+[a-z0-9-]+\s+0\s+[\w ]+$/i.test(plantillaPri.radio24)) {
+        radio24Prestado = plantillaPri.radio24.replace('{ID}', String(onuId));
+      }
+    }
     if (!plantilla.pri.lineas.length) {
       cli.close();
       return { success: false, message: 'La OLT no tiene ninguna ONU en modo router de la cual copiar la config' };
     }
-    const respaldo = parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${onuId}`) || [];
     // EPON: una ONU recien registrada solo tiene `confirm onu mac <mac> onuid <id>` a
     // nivel de puerto (ninguna linea `onu <id> ...`): existe y esta lista para configurar.
     const registradaEpon = isEpon(oltCfg.tec)
@@ -1161,7 +1342,7 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     // (Lazaro, Buenos Aires 2026-10-06: sin esta linea la red de 2.4 no salia). Si
     // falta, se agrega con la region y el modo mas comunes de la OLT y canal 0
     // (automatico). Es el "cambio de region" que soporte hacia a mano.
-    const radio24 = lineaRadio24(cfg, onuId);
+    const radio24 = lineaRadio24(cfg, onuId) || radio24Prestado;
     if (radio24 && !comandos.some(l => /\bpri\s+wifi_switch\b/i.test(l)) && comandos.some(l => /\bpri\s+wifi_ssid\s+[1-4]\b/i.test(l))) {
       comandos.unshift(radio24);
     }
@@ -1366,6 +1547,7 @@ module.exports = {
   oltComandoOnu, oltConfigPuerto, oltShowOnu,
   parseOnuBlocks,
   aprenderPlantillas,
+  perfilesDefinidos, authDePerfilesPropios, perfilesQueFaltan, vlanDeServicio,
   oltPlantilla,
   oltAuthorizeAprendido,
   oltConfigurarWan,
