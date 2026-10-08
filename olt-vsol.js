@@ -1369,8 +1369,14 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
  * Antes de escribir devuelve el respaldo: las lineas que esa ONU tenia, para
  * poder regresarlas. Con `dryRun` no escribe nada.
  */
-async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null, plantillaPri = null }) {
+async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null, plantillaPri = null, vlanWan = null, aceptarFormaOlt = false }) {
   if (!ponPort || !onuId) return { success: false, message: 'Faltan ponPort y onuId' };
+  // EPON sin plantilla del modelo (Coyol Norte 2026-10-08, ALAQ): el panel verifica la VLAN del
+  // PPPoE server del router de la OLT (/router/pppoe-vlans) y la manda como `vlanWan`. Con ella,
+  //   - `aceptarFormaOlt`: la forma mas comun de la OLT solo se manda si su wan_vlan es esa;
+  //   - `plantillaPri` (prestada de otra OLT EPON): su wan_vlan se cambia por esa.
+  // Sin `vlanWan` nada de esto aplica en EPON (se comporta como antes).
+  const vlanPanel = Number.isInteger(Number(vlanWan)) && Number(vlanWan) >= 1 && Number(vlanWan) <= 4094 ? Number(vlanWan) : null;
   // SSID de 5 GHz: solo lo usan los modelos doble banda; sin el, la misma red en las dos bandas
   ssid5 = ssid5 || ssid;
   for (const [k, v] of Object.entries({ pppUser, pppPass, ssid, ssid5, wifiKey })) {
@@ -1393,14 +1399,17 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     // que manda el panel, de otra OLT del mismo router o del parque. La VLAN de la WAN
     // se cambia por la de esta OLT si se puede leer; si no, se queda la de la fuente y se dice.
     let radio24Prestado = null;
-    if (plantilla.pri.fuente !== 'modelo' && !isEpon(oltCfg.tec) && plantillaPri && plantillaValida(plantillaPri.lineas, PRI_PRESTADA_RE)) {
+    const epon = isEpon(oltCfg.tec);
+    // EPON: la VLAN no se puede leer de la OLT (no hay perfiles line); sin la del panel no se presta.
+    if (plantilla.pri.fuente !== 'modelo' && (!epon || vlanPanel != null) && plantillaPri && plantillaValida(plantillaPri.lineas, PRI_PRESTADA_RE)) {
       const de = String(plantillaPri.de || 'otra OLT').slice(0, 80);
-      const vlan = vlanDeServicio(cfg, respaldo);
+      const vlan = epon ? vlanPanel : vlanDeServicio(cfg, respaldo);
       const vlanFuente = plantillaPri.lineas.map(l => l.match(/\bwan_vlan\s+(\d+)\b/i)).find(Boolean)?.[1] || null;
       const lineas = vlan != null ? plantillaPri.lineas.map(l => l.replace(/(\bwan_vlan\s+)\d+\b/i, `$1${vlan}`)) : plantillaPri.lineas.slice();
       const vlanNota = !vlanFuente ? null
         : vlan == null ? `no se pudo leer la VLAN de esta OLT: se deja la de la fuente, ${vlanFuente}`
-          : String(vlan) === vlanFuente ? `VLAN ${vlan}, igual en las dos OLTs` : `VLAN ${vlanFuente} de la fuente cambiada por ${vlan} de esta OLT`;
+          : epon ? (String(vlan) === vlanFuente ? `VLAN ${vlan}, la del PPPoE server del router` : `VLAN ${vlanFuente} de la fuente cambiada por ${vlan}, la del PPPoE server del router`)
+            : String(vlan) === vlanFuente ? `VLAN ${vlan}, igual en las dos OLTs` : `VLAN ${vlanFuente} de la fuente cambiada por ${vlan} de esta OLT`;
       plantilla.pri = {
         lineas, coinciden: Number(plantillaPri.coinciden) || 0, total: Number(plantillaPri.total) || 0, variantes: Number(plantillaPri.variantes) || 0,
         fuente: 'prestada', de, modelo: plantilla.pri.modelo || plantillaPri.modelo || null,
@@ -1414,6 +1423,15 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
     if (!plantilla.pri.lineas.length) {
       cli.close();
       return { success: false, message: 'La OLT no tiene ninguna ONU en modo router de la cual copiar la config' };
+    }
+    // Forma mas comun de la OLT autorizada por el panel: solo con la VLAN que el panel verifico.
+    if (aceptarFormaOlt && plantilla.pri.fuente === 'olt') {
+      const vlanForma = plantilla.pri.lineas.map(l => l.match(/\bwan_vlan\s+(\d+)\b/i)).find(Boolean)?.[1] || null;
+      if (vlanPanel == null || vlanForma == null || Number(vlanForma) !== vlanPanel) {
+        cli.close();
+        return { success: false, message: `La forma mas comun de la OLT usa VLAN ${vlanForma || 'ninguna'} y el panel solo autorizo la ${vlanPanel ?? 'ninguna'} (PPPoE server del router): no se manda` };
+      }
+      plantilla.pri = { ...plantilla.pri, vlan: vlanPanel, detalle: `forma mas comun de la OLT (${plantilla.pri.coinciden} de ${plantilla.pri.total}); wan_vlan ${vlanPanel} = PPPoE server del router` };
     }
     // EPON: una ONU recien registrada solo tiene `confirm onu mac <mac> onuid <id>` a
     // nivel de puerto (ninguna linea `onu <id> ...`): existe y esta lista para configurar.

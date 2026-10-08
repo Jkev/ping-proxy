@@ -398,6 +398,39 @@ async function listActivePPPoESessions(routerIp, creds = null) {
   }
 }
 
+// ==================== VLAN DEL PPPoE SERVER (solo lectura) ====================
+// Activacion EPON sin plantilla del modelo (Coyol Norte 2026-10-08, ALAQ): la config de modem
+// que se copia de la OLT solo sirve si su `wan_vlan` es la VLAN donde escucha el PPPoE server
+// del router. Lee /interface/pppoe-server/server, /interface/vlan y /interface/bridge/port
+// (el server puede estar sobre una VLAN o sobre un bridge con VLANs). No escribe nada.
+async function pppoeServerVlans(routerIp, creds = null) {
+  const conn = buildRouterConn(routerIp, creds);
+  try {
+    await withTimeout(conn.connect(), 15000, 'Timeout conectando al router');
+    const [servidores, vlans, puertos] = await Promise.all([
+      conn.write('/interface/pppoe-server/server/print'),
+      conn.write('/interface/vlan/print'),
+      conn.write('/interface/bridge/port/print').catch(() => []),
+    ]);
+    await conn.close();
+    const si = (v) => v === true || v === 'true' || v === 'yes';
+    const vlanDe = new Map((vlans || []).map(v => [v.name, { id: parseInt(v['vlan-id'], 10), deshabilitada: si(v.disabled) }]));
+    const res = (servidores || []).map(s => {
+      const interfaz = s.interface || '';
+      let ids = [];
+      if (vlanDe.has(interfaz)) ids = [vlanDe.get(interfaz).id];
+      else ids = (puertos || []).filter(p => p.bridge === interfaz && vlanDe.has(p.interface) && !si(p.disabled)).map(p => vlanDe.get(p.interface).id);
+      return { nombre: s['service-name'] || s.name || '', interfaz, deshabilitado: si(s.disabled), vlans: ids.filter(n => Number.isInteger(n)) };
+    });
+    const activas = [...new Set(res.filter(s => !s.deshabilitado).flatMap(s => s.vlans))].sort((a, b) => a - b);
+    return { success: true, servidores: res, vlans: activas };
+  } catch (error) {
+    try { await conn.close(); } catch { /* ya cerrada */ }
+    console.error(`[PPPoEVlans] Error en ${routerIp}:`, error.message);
+    return { success: false, servidores: [], vlans: [], message: error.message || 'Error leyendo el PPPoE server' };
+  }
+}
+
 // ==================== LIMPIAR ADDRESS-LIST DE FIREWALL ====================
 
 async function clearFirewallAddressList(routerIp, listName, creds = null) {
@@ -1248,6 +1281,36 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // VLAN(s) del PPPoE server de un router (solo lectura; activacion EPON)
+  if (req.method === 'POST' && req.url === '/router/pppoe-vlans') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const parsed = JSON.parse(body || '{}');
+        if (!parsed.ipRouter) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, message: 'Falta parámetro: ipRouter' }));
+          return;
+        }
+        const result = await pppoeServerVlans(parsed.ipRouter, pickCreds(parsed));
+        res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error('[Error]', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, message: 'Error interno' }));
+      }
+    });
+    return;
+  }
+
   // Listar sesiones PPPoE activas de un router
   if (req.method === 'POST' && req.url === '/ppp/list-active') {
     const authHeader = req.headers['authorization'];
@@ -1769,6 +1832,10 @@ const server = http.createServer(async (req, res) => {
       modelo: p.modelo || null, mismoModelo: Array.isArray(p.mismoModelo) ? p.mismoModelo : null,
       // OLT con menos de 3 modems del modelo: plantilla prestada de una OLT hermana o del parque
       plantillaPri: p.plantillaPri && typeof p.plantillaPri === 'object' ? p.plantillaPri : null,
+      // EPON sin plantilla del modelo: VLAN del PPPoE server verificada por el panel, y si se
+      // acepta la forma mas comun de la OLT (solo con esa VLAN). Ver oltConfigurarWan.
+      vlanWan: p.vlanWan != null ? parseInt(p.vlanWan, 10) : null,
+      aceptarFormaOlt: p.aceptarFormaOlt === true,
     }),
     // Diagnostico acotado a una ONU (ver olt-vsol.js): ayuda `?` y un comando `onu <id> pri ...`
     '/olt/ayuda': (cfg, p) => oltAyudaOnu(cfg, { ponPort: parseInt(p.ponPort, 10), consultas: Array.isArray(p.consultas) ? p.consultas : [] }),
