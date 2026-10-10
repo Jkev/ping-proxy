@@ -1619,6 +1619,53 @@ async function oltShowOnu(oltCfg, { ponPort, comandos = [] }) {
   }
 }
 
+/**
+ * Red WiFi que el MODEM tiene de verdad (solo lectura): `show onu <id> pri wifi_ssid <n>`
+ * se lo pregunta a la ONU por OAM, a diferencia del running-config, que solo dice lo que la
+ * OLT le mando. Sirve para confirmar que la 2.4 GHz quedo: en V364 EPON recien
+ * registrados (UPFE 6-oct, FXNS 8-oct, BMEZ 10-oct) la linea `wifi_ssid 1` quedo en la
+ * OLT pero el modem siguio con el SSID de fabrica, y reenviarla despues lo arreglo.
+ * Nunca devuelve la clave: solo el nombre de cada SSID y la salida sin las lineas que
+ * mencionan key/pass/psk.
+ */
+const LINEA_SECRETA_RE = /(key|pass|psk|secret)/i;
+
+function nombreSsidDeSalida(salida) {
+  for (const raw of stripAnsi(String(salida || '')).split('\n')) {
+    const l = raw.trim();
+    const m = l.match(/^(?:wifi\s*)?ssid(?:\s*name)?\s*[:=]\s*(\S+)/i) || l.match(/^name\s*[:=]\s*(\S+)/i);
+    if (m && !LINEA_SECRETA_RE.test(l.split(/[:=]/)[0])) return m[1];
+  }
+  return null;
+}
+
+async function oltWifiOnu(oltCfg, { ponPort, onuId, indices = [1] }) {
+  const id = parseInt(onuId, 10);
+  const idx = [...new Set((Array.isArray(indices) ? indices : []).map(n => parseInt(n, 10)).filter(n => n >= 1 && n <= 10))].slice(0, 8);
+  if (!ponPort || !id || !idx.length) return { success: false, message: 'Faltan ponPort, onuId e indices (1-10)' };
+  const slot = parseInt(oltCfg.slot, 10) || 0;
+  const cli = new VsolCli(oltCfg);
+  try {
+    await cli.connect();
+    await cli.login();
+    await cli.exec(`interface ${interfaceKw(oltCfg.tec)} ${slot}/${ponPort}`);
+    const ssids = [];
+    for (const n of idx) {
+      let salida = '';
+      let error = null;
+      try { salida = await cli.exec(`show onu ${id} pri wifi_ssid ${n}`, 30000); } catch (e) { error = e.message; }
+      const limpia = stripAnsi(salida).split('\n').map(l => l.trim())
+        .filter(l => l && !LINEA_SECRETA_RE.test(l)).map(sinSecretos).join('\n').slice(0, 1500);
+      ssids.push({ index: n, name: error ? null : nombreSsidDeSalida(salida), salida: limpia, ...(error ? { error } : {}) });
+    }
+    cli.close();
+    return { success: true, ssids };
+  } catch (e) {
+    cli.close();
+    return { success: false, message: e.message || 'Error leyendo el WiFi de la ONU' };
+  }
+}
+
 async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) {
   const id = parseInt(onuId, 10);
   const cmd = String(comando || '').trim();
@@ -1649,7 +1696,7 @@ async function oltComandoOnu(oltCfg, { ponPort, onuId, comando, save = false }) 
 module.exports = {
   VsolCli,
   oltAyudaOnu,
-  oltComandoOnu, oltConfigPuerto, oltShowOnu,
+  oltComandoOnu, oltConfigPuerto, oltShowOnu, oltWifiOnu, nombreSsidDeSalida,
   parseOnuBlocks,
   aprenderPlantillas,
   perfilesDefinidos, authDePerfilesPropios, perfilesQueFaltan, vlanDeServicio,

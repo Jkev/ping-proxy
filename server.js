@@ -3,7 +3,7 @@ const http = require('http');
 const { RouterOSAPI } = require('routeros');
 const cron = require('node-cron');
 const fetch = require('node-fetch');
-const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe, oltPlantilla, oltAuthorizeAprendido, oltConfigurarWan, oltAyudaOnu, oltComandoOnu, oltConfigPuerto, oltShowOnu } = require('./olt-vsol');
+const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe, oltPlantilla, oltAuthorizeAprendido, oltConfigurarWan, oltAyudaOnu, oltComandoOnu, oltConfigPuerto, oltShowOnu, oltWifiOnu } = require('./olt-vsol');
 const { ucmStatus, ucmReboot } = require('./ucm-ssh');
 
 // Configuración
@@ -1844,6 +1844,8 @@ const server = http.createServer(async (req, res) => {
     '/olt/config-puerto': (cfg, p) => oltConfigPuerto(cfg, { ponPort: parseInt(p.ponPort, 10), onuIds: Array.isArray(p.onuIds) ? p.onuIds : [] }),
     // Solo lectura: modelo/version de las ONUs (lista cerrada de `show onu ...`)
     '/olt/show-onu': (cfg, p) => oltShowOnu(cfg, { ponPort: parseInt(p.ponPort, 10), comandos: Array.isArray(p.comandos) ? p.comandos : [] }),
+    // Solo lectura: nombre de los SSID que el modem tiene de verdad (OAM), nunca la clave
+    '/olt/onu-wifi': (cfg, p) => oltWifiOnu(cfg, { ponPort: parseInt(p.ponPort, 10), onuId: p.onuId, indices: Array.isArray(p.indices) ? p.indices : [1] }),
   };
   if (req.method === 'POST' && RUTAS_ALTA[req.url]) {
     const authHeader = req.headers['authorization'];
