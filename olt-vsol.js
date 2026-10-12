@@ -954,7 +954,53 @@ const formaClara = (f) => f.total > 0 && f.coinciden >= 2 && f.coinciden / f.tot
  * Las fuentes nuevas traen `detalle` con de donde salio; `coinciden/total` son los del
  * grupo de donde salio (salvo 'puerto_olt', que el panel acepta por su fuente).
  */
-function elegirFormaAuth(authPuerto, auth) {
+function elegirFormaAuth(authPuerto, auth, { usable = null } = {}) {
+  const elegida = elegirFormaAuthBase(authPuerto, auth);
+  if (!tienePortid(elegida.plantilla.lineas)) return elegida;
+  return formaSinPortid(authPuerto, auth, elegida, usable) || elegida;
+}
+
+/** `portid N` es propio de cada ONU (145, 168, 172… en Palma Real): la forma que lo trae no se copia. */
+const PORTID_RE = /\bportid\s+\d+/i;
+const tienePortid = (lineas) => lineas.some(l => PORTID_RE.test(l));
+/**
+ * Forma que de verdad deja la ONU con servicio: perfil line/srv, o service/service-port.
+ * Lo que la OLT agrega sola con auto-learn (`onu add N profile default sn …`, a veces mas
+ * `onu N profile onu default`) no cuenta: copiarlo deja la ONU sin VLAN.
+ */
+const formaCompleta = (lineas) => lineas.some(l => /\bprofile\s+(line|srv)\s+name\s+(?!default)\S+/i.test(l) || /^onu\s+\S+\s+service(-port)?\s/i.test(l));
+
+/**
+ * La forma elegida trae `portid` (Palma Real 2026-10-12, IXVR: puerto 8 con una ONU de
+ * bloque con `portid 145`, una con perfiles VLAN1010/srv_1010 y la recien agregada por
+ * auto-learn; ninguna llegaba al umbral, ganaba la primera por orden y la activacion se
+ * detenia). Se busca la forma mas comun SIN portid, completa y con perfiles que la OLT
+ * tenga: primero en el puerto, luego en la OLT (todas, o solo V-SOL si entre ellas es
+ * clara). null si no hay. `coinciden/total` son los de ese grupo (sin portid y completas).
+ */
+function formaSinPortid(authPuerto, auth, elegida, usable) {
+  const sirve = (b) => b.length > 0 && !tienePortid(b) && formaCompleta(b) && (!usable || usable(b));
+  const descartada = `se descarto la forma ${elegida.fuente === 'olt' ? 'de la OLT' : 'del puerto'} porque trae un portid propio de cada ONU`;
+  const enPuerto = formaMasComun(authPuerto.filter(sirve));
+  if (enPuerto.lineas.length) {
+    return {
+      plantilla: enPuerto, fuente: 'puerto_sin_portid',
+      detalle: `forma sin portid mas comun del puerto (${enPuerto.coinciden} de ${enPuerto.total} ONUs sin portid); ${descartada}`,
+    };
+  }
+  const olt = auth.filter(sirve);
+  const fTodas = formaMasComun(olt);
+  const fVsol = formaMasComun(olt.filter(b => b.vsol));
+  const usarVsol = !formaClara(fTodas) && formaClara(fVsol);
+  const f = usarVsol ? fVsol : fTodas;
+  if (!f.lineas.length) return null;
+  return {
+    plantilla: f, fuente: 'olt_sin_portid',
+    detalle: `forma sin portid mas comun de la OLT${usarVsol ? ' entre sus ONUs V-SOL' : ''} (${f.coinciden} de ${f.total} ONUs sin portid); ${descartada}`,
+  };
+}
+
+function elegirFormaAuthBase(authPuerto, auth) {
   const conLineas = (bs) => bs.filter(b => b.length);
   const puerto = conLineas(authPuerto);
   const todas = conLineas(auth);
@@ -1028,7 +1074,9 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
       }
     }
   }
-  const { plantilla: authPlantilla, fuente: authFuente, detalle: authDetalle } = elegirFormaAuth(authPuerto, auth);
+  // Una forma sin portid solo sirve si la OLT tiene los perfiles que nombra (si se pueden leer).
+  const usable = (lineas) => !perfilesQueFaltanConocidos(lineas, output).length;
+  const { plantilla: authPlantilla, fuente: authFuente, detalle: authDetalle } = elegirFormaAuth(authPuerto, auth, { usable });
   const estilo = authPlantilla.lineas.some(l => /\bprofile\s+line\b/i.test(l)) ? 'perfiles' : 'bloque';
   // Con menos de 3 del mismo modelo no hay forma "mas comun" confiable: se usa la de
   // toda la OLT y se dice, para que la persona la revise.
@@ -1152,6 +1200,23 @@ function perfilesQueFaltan(lineas, output) {
     for (const v of l.matchAll(/\b(?:uservlan|vlan)\s+(\d+)\b/gi)) {
       if (!vlans.has(parseInt(v[1], 10))) faltan.push(`vlan ${v[1]}`);
     }
+  }
+  return [...new Set(faltan)];
+}
+
+/**
+ * Como `perfilesQueFaltan`, pero solo perfiles line/srv y solo si el running-config trae
+ * definiciones de ese tipo que se puedan leer: la forma sale de ONUs que ya los usan en
+ * esta misma OLT, asi que si las definiciones no se pudieron leer no se bloquea.
+ */
+function perfilesQueFaltanConocidos(lineas, output) {
+  const p = perfilesDefinidos(output);
+  const faltan = [];
+  for (const l of lineas) {
+    const pl = l.match(/\bprofile\s+(line|srv)\s+name\s+(\S+)/i);
+    if (!pl) continue;
+    const tipo = pl[1].toLowerCase();
+    if (p[tipo].length && !p[tipo].some(x => x.name === pl[2])) faltan.push(`${tipo} ${pl[2]}`);
   }
   return [...new Set(faltan)];
 }
@@ -1293,9 +1358,11 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
 
     // `portid N` es propio de cada ONU (145, 161, 163… en Palma Real): una forma que lo
     // trae no se puede copiar a otra ONU.
-    if (plantilla.auth.lineas.some(l => /\bportid\s+\d+/i.test(l))) {
+    // trae no se puede copiar a otra ONU. `aprenderPlantillas` ya busco una forma sin portid
+    // (puerto, luego OLT); si llega aqui con portid es que no hay ninguna.
+    if (tienePortid(plantilla.auth.lineas)) {
       cli.close();
-      return { success: false, message: 'La forma de autorizar trae un portid propio de cada ONU: no se puede copiar, autorizar a mano', plantilla: plantilla.auth };
+      return { success: false, message: 'La forma de autorizar trae un portid propio de cada ONU y no hay en el puerto ni en la OLT una forma sin portid que copiar: autorizar a mano', plantilla: plantilla.auth };
     }
 
     await cli.exec(`interface gpon ${slot}/${ponPort}`);
@@ -1698,7 +1765,7 @@ module.exports = {
   oltAyudaOnu,
   oltComandoOnu, oltConfigPuerto, oltShowOnu, oltWifiOnu, nombreSsidDeSalida,
   parseOnuBlocks,
-  aprenderPlantillas,
+  aprenderPlantillas, elegirFormaAuth,
   perfilesDefinidos, authDePerfilesPropios, perfilesQueFaltan, vlanDeServicio,
   oltPlantilla,
   oltAuthorizeAprendido,
