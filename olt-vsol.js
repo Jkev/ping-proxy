@@ -1088,6 +1088,10 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
     pri: {
       ...formaMasComun(priFuente === 'modelo' ? priModelo : pri), fuente: priFuente, modelo: modelo || null,
       ...(epon ? { valores: { CANAL: canal } } : {}),
+      // Menos de 3 del modelo: su forma mas comun viaja aparte (sola no se usa). El panel la
+      // autoriza (`aceptarModeloCorto`) si son al menos 2, todas iguales, y su VLAN cuadra con
+      // el router (Hidalgo Amajac 2026-10-13, CGIM: 2 V364 identicos, PPPoE sin VLAN).
+      ...(priFuente !== 'modelo' && priModelo.length ? { modeloCorto: formaMasComun(priModelo) } : {}),
     },
   };
 }
@@ -1436,12 +1440,15 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
  * Antes de escribir devuelve el respaldo: las lineas que esa ONU tenia, para
  * poder regresarlas. Con `dryRun` no escribe nada.
  */
-async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null, plantillaPri = null, vlanWan = null, aceptarFormaOlt = false }) {
+async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid, ssid5, wifiKey, dryRun = false, save = true, modelo = null, mismoModelo = null, plantillaPri = null, vlanWan = null, aceptarFormaOlt = false, aceptarModeloCorto = false, sinVlanWan = false }) {
   if (!ponPort || !onuId) return { success: false, message: 'Faltan ponPort y onuId' };
   // EPON sin plantilla del modelo (Coyol Norte 2026-10-08, ALAQ): el panel verifica la VLAN del
   // PPPoE server del router de la OLT (/router/pppoe-vlans) y la manda como `vlanWan`. Con ella,
   //   - `aceptarFormaOlt`: la forma mas comun de la OLT solo se manda si su wan_vlan es esa;
   //   - `plantillaPri` (prestada de otra OLT EPON): su wan_vlan se cambia por esa.
+  //   - `aceptarModeloCorto`: la forma de los <3 modems del MISMO modelo en ESTA OLT, solo si son
+  //     ≥2 y todos iguales y su wan_vlan es `vlanWan`, o con `sinVlanWan` (el PPPoE server del
+  //     router esta en una interfaz sin VLAN, Hidalgo Amajac 2026-10-13) no traen wan_vlan.
   // Sin `vlanWan` nada de esto aplica en EPON (se comporta como antes).
   const vlanPanel = Number.isInteger(Number(vlanWan)) && Number(vlanWan) >= 1 && Number(vlanWan) <= 4094 ? Number(vlanWan) : null;
   // SSID de 5 GHz: solo lo usan los modelos doble banda; sin el, la misma red en las dos bandas
@@ -1486,6 +1493,31 @@ async function oltConfigurarWan(oltCfg, { ponPort, onuId, pppUser, pppPass, ssid
       if (typeof plantillaPri.radio24 === 'string' && /^onu\s+\{ID\}\s+pri\s+wifi_switch\s+enable\s+[a-z0-9-]+\s+0\s+[\w ]+$/i.test(plantillaPri.radio24)) {
         radio24Prestado = plantillaPri.radio24.replace('{ID}', String(onuId));
       }
+    }
+    // Menos de 3 del modelo en ESTA OLT, autorizada explicito por el panel (ver arriba).
+    if (aceptarModeloCorto && plantilla.pri.fuente !== 'modelo' && plantilla.pri.fuente !== 'prestada') {
+      const mc = plantilla.pri.modeloCorto || null;
+      const vlanForma = mc ? (mc.lineas.map(l => l.match(/\bwan_vlan\s+(\d+)\b/i)).find(Boolean)?.[1] || null) : null;
+      const unanimes = !!mc && mc.coinciden >= 2 && mc.coinciden === mc.total && mc.lineas.some(l => l.includes('{USER}'));
+      const vlanOk = sinVlanWan === true
+        ? (vlanForma == null && vlanPanel == null)
+        : (vlanPanel != null && vlanForma != null && Number(vlanForma) === vlanPanel);
+      if (!unanimes || !vlanOk) {
+        cli.close();
+        return {
+          success: false,
+          message: !unanimes
+            ? `Los modems de este modelo en la OLT no coinciden (${mc ? `${mc.coinciden} de ${mc.total}` : 'ninguno configurado'}): no se manda`
+            : `Los modems de este modelo en la OLT usan VLAN ${vlanForma || 'ninguna'} y el panel autorizo ${sinVlanWan === true ? 'sin VLAN' : `la ${vlanPanel ?? 'ninguna'}`} (PPPoE server del router): no se manda`,
+        };
+      }
+      plantilla.pri = {
+        lineas: mc.lineas, coinciden: mc.coinciden, total: mc.total, variantes: mc.variantes,
+        fuente: 'modelo_corto', modelo: plantilla.pri.modelo || null,
+        ...(plantilla.pri.valores ? { valores: plantilla.pri.valores } : {}),
+        vlan: vlanPanel,
+        detalle: `los ${mc.total} modems de este modelo en la OLT, iguales; ${sinVlanWan === true ? 'sin VLAN, como el PPPoE server del router' : `wan_vlan ${vlanPanel} = PPPoE server del router`}`,
+      };
     }
     if (!plantilla.pri.lineas.length) {
       cli.close();
