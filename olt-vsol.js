@@ -914,7 +914,8 @@ function formaMasComun(bloques) {
 /**
  * Aprende de un running-config:
  *   - auth: el bloque de autorizacion (todo menos desc y pri) mas comun del
- *     PUERTO pedido; si el puerto no tiene ONUs, el de toda la OLT.
+ *     PUERTO pedido; si el puerto no tiene ONUs, el de toda la OLT (o, si esa no
+ *     es clara, el que gana puerto por puerto: ver elegirFormaAuth).
  *   - pri:  la config de modem mas comun de la OLT (solo ONUs en modo router),
  *     aprendida de ONUs del MISMO MODELO que la destino (`onuId`). El modelo es
  *     la linea `pri equid VSOLV414`: puertos LAN y WiFi cambian por modelo y
@@ -950,7 +951,9 @@ const formaClara = (f) => f.total > 0 && f.coinciden >= 2 && f.coinciden / f.tot
  *   4. puerto de <=4 ONUs cuya forma es la mas comun de la OLT      → 'puerto_olt'
  *   5. si no, la del puerto tal cual (el panel se detiene)          → 'puerto'
  * Con menos de 3 en el puerto, la de la OLT como antes (Palma Real 2026-10-06), o la de
- * sus V-SOL si la de todas no es clara.
+ * sus V-SOL si la de todas no es clara. Si ninguna de las dos es clara y el puerto no
+ * tiene V-SOL (vacio), la que gana puerto por puerto, si es clara → 'puertos_olt'
+ * (`coinciden/total` son puertos, no ONUs; ver formaPorPuertos).
  * Las fuentes nuevas traen `detalle` con de donde salio; `coinciden/total` son los del
  * grupo de donde salio (salvo 'puerto_olt', que el panel acepta por su fuente).
  */
@@ -1000,6 +1003,47 @@ function formaSinPortid(authPuerto, auth, elegida, usable) {
   };
 }
 
+/**
+ * Puerto vacio (o sin V-SOL) en una OLT cuya forma de conjunto no es clara (Colatlan
+ * 2026-10-14, USVE: 509 de 814 ONUs, 17 variantes, y la activacion se detenia, mientras
+ * los puertos vecinos usaban todos la misma: VLAN1010/srv_1010). Revolver toda la OLT
+ * mezcla puertos que tienen cada uno su forma con ONUs viejas o de otra marca, y un puerto
+ * grande pesa por todos. Aqui cada puerto con ONUs V-SOL vota UNA vez por la forma mas
+ * comun de sus V-SOL (un empate en el puerto no vota, pero cuenta en el total) y se acepta
+ * la que gana en la mayoria de esos puertos, solo si es clara (`formaClara` sobre puertos:
+ * >=2 y >=80%). `coinciden/total` = puertos que la usan / puertos con ONUs V-SOL.
+ * null si no es clara (el panel se detiene como antes).
+ */
+function formaPorPuertos(todas, fOlt) {
+  const porPuerto = new Map();
+  for (const b of todas) {
+    if (!b.puerto || !b.vsol) continue;
+    if (!porPuerto.has(b.puerto)) porPuerto.set(b.puerto, []);
+    porPuerto.get(b.puerto).push(b);
+  }
+  const votos = new Map();
+  const onus = new Map();
+  for (const bs of porPuerto.values()) {
+    const cuenta = new Map();
+    for (const b of bs) { const k = b.join('\n'); cuenta.set(k, (cuenta.get(k) || 0) + 1); }
+    const orden = [...cuenta.entries()].sort((a, b) => b[1] - a[1]);
+    if (orden.length > 1 && orden[0][1] === orden[1][1]) continue;
+    const [k, c] = orden[0];
+    votos.set(k, (votos.get(k) || 0) + 1);
+    onus.set(k, (onus.get(k) || 0) + c);
+  }
+  let mejor = null;
+  let n = 0;
+  for (const [k, c] of votos) if (c > n) { mejor = k; n = c; }
+  const f = { lineas: mejor ? mejor.split('\n') : [], coinciden: n, total: porPuerto.size, variantes: votos.size };
+  if (!formaClara(f)) return null;
+  return {
+    plantilla: f, fuente: 'puertos_olt',
+    detalle: `puerto sin ONUs V-SOL: forma mas comun en ${n} de ${porPuerto.size} puertos con V-SOL de la OLT (${onus.get(mejor)} ONUs)`
+      + (fOlt && fOlt.total ? `; la de toda la OLT no era clara (${fOlt.coinciden} de ${fOlt.total})` : ''),
+  };
+}
+
 function elegirFormaAuthBase(authPuerto, auth) {
   const conLineas = (bs) => bs.filter(b => b.length);
   const puerto = conLineas(authPuerto);
@@ -1010,7 +1054,12 @@ function elegirFormaAuthBase(authPuerto, auth) {
     if (formaClara(fOlt) || !formaClara(fOltVsol)) return { plantilla: fOlt, fuente: 'olt', detalle: motivo && formaClara(fOlt) ? `forma mas comun de la OLT (${fOlt.coinciden} de ${fOlt.total} ONUs); ${motivo}` : null };
     return { plantilla: fOltVsol, fuente: 'olt', detalle: `forma mas comun de la OLT entre sus ONUs V-SOL (${fOltVsol.coinciden} de ${fOltVsol.total})${motivo ? `; ${motivo}` : ''}` };
   };
-  if (puerto.length < 3) return deOlt(null);
+  if (puerto.length < 3) {
+    const r = deOlt(null);
+    // Puerto vacio (o sin V-SOL) y la OLT revuelta: la forma que gana puerto por puerto.
+    if (!puerto.some(b => b.vsol) && !formaClara(r.plantilla)) return formaPorPuertos(todas, r.plantilla) || r;
+    return r;
+  }
   const fPuerto = formaMasComun(puerto);
   if (formaClara(fPuerto)) return { plantilla: fPuerto, fuente: 'puerto', detalle: null };
 
@@ -1063,6 +1112,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
     // V-SOL = SN de V-SOL (VSOL/GPON/MONU) o con config `pri`: las de otra marca van en
     // bridge y la OLT no les escribe `pri`. Se marca en el propio arreglo.
     a.vsol = esBloqueVsol(lines);
+    a.puerto = key.split(':')[0];
     auth.push(a);
     if (ponPort != null && key.startsWith(`${slot}/${ponPort}:`)) authPuerto.push(a);
     if (p.some(l => l.includes('{USER}'))) {
