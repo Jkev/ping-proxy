@@ -12,6 +12,9 @@ const API_KEY = process.env.PROXY_API_KEY || 'tu-api-key-secreta-aqui';
 const MIKROTIK_USER = process.env.MIKROTIK_USER || 'mario';
 const MIKROTIK_PASSWORD = process.env.MIKROTIK_PASSWORD || '';
 const MIKROTIK_PORT = parseInt(process.env.MIKROTIK_PORT || '8728', 10);
+// Tope para un comando ya conectado. Por encima de cualquier consulta real (un
+// /ppp/active/print de un router grande tarda ~2 s) y por debajo de romper el ciclo horario.
+const WRITE_TIMEOUT_MS = parseInt(process.env.MIKROTIK_WRITE_TIMEOUT_MS || '30000', 10);
 
 // UCM (Grandstream) — credenciales SSH ADMIN para la CLI de mantenimiento.
 // Se pueden pasar por request (ucmHost/ucmUser/ucmPass) o dejar estos defaults.
@@ -211,13 +214,46 @@ function buildRouterConn(routerIp, creds) {
   let host = routerIp, embeddedPort;
   const m = /^(.+):(\d+)$/.exec(String(routerIp));
   if (m) { host = m[1]; embeddedPort = parseInt(m[2], 10); }
-  return new RouterOSAPI({
+  const conn = new RouterOSAPI({
     host,
     port: (creds && creds.port) || embeddedPort || MIKROTIK_PORT,
     user: (creds && creds.user) || MIKROTIK_USER,
     password: (creds && creds.password !== undefined) ? creds.password : MIKROTIK_PASSWORD,
     timeout: 10,
   });
+
+  // Un router que falla DESPUES del login (ECONNRESET, o los 10 s de inactividad que el
+  // socket se da a si mismo) hace que la libreria emita 'error' sobre el RouterOSAPI, que
+  // es un EventEmitter. Sin un listener, Node lanza la excepcion y TUMBA el proceso
+  // entero; systemd lo revive a los 5 s (Restart=on-failure), que es por lo que esto se
+  // veia como "el proxy se cayo solo" y se perdian las peticiones en vuelo.
+  conn.on('error', (e) => console.error(`[Router] ${routerIp}: error de socket: ${e && e.message}`));
+
+  // La promesa de conn.write() solo se liquida con 'done' o con 'trap' (Channel.js). Si el
+  // socket muere a media consulta no llega ninguno de los dos y el await queda colgado PARA
+  // SIEMPRE: en el ciclo horario eso congela la pasada completa. El timeout va aqui, y no en
+  // las 27 llamadas, para que ninguna se quede fuera ni hoy ni cuando se agregue otra.
+  const escribir = conn.write.bind(conn);
+  conn.write = (...args) => withTimeout(
+    escribir(...args),
+    WRITE_TIMEOUT_MS,
+    `Timeout ejecutando ${Array.isArray(args[0]) ? args[0][0] : args[0]} en ${routerIp}`
+  );
+
+  return conn;
+}
+
+/**
+ * Cierra la conexion pase lo que pase. No lanza nunca.
+ *
+ * No basta con `try { await conn.close() } catch {}`: close() resuelve SIN hacer nada
+ * cuando `connected` es false, que es justo el caso de un connect() que se paso de tiempo
+ * (ahi el socket sigue vivo). Por eso, si la libreria dejo el connector en pie, se destruye.
+ */
+async function cerrarRouter(conn) {
+  if (!conn) return;
+  try { await conn.close(); } catch (_) { /* ALRDYCLOSNG, o nunca llego a conectar */ }
+  try { if (conn.connector) conn.connector.destroy(); } catch (_) {}
 }
 
 function pickCreds(body) {
@@ -310,6 +346,8 @@ async function getClientStatus(routerIp, targetIp, pppUser = null, creds = null)
       clientIp: targetIp,
       message: error.message || 'Error de conexión al router',
     };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -367,6 +405,8 @@ async function disconnectPPPoE(routerIp, pppUser, creds = null) {
   } catch (error) {
     console.error('[Disconnect] Error:', error.message);
     return { success: false, message: error.message || 'Error desconectando sesión' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -395,6 +435,8 @@ async function listActivePPPoESessions(routerIp, creds = null) {
   } catch (error) {
     console.error(`[PPPListActive] Error en ${routerIp}:`, error.message);
     return { success: false, count: 0, sessions: [], message: error.message || 'Error consultando sesiones' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -445,9 +487,10 @@ async function pppoeServerVlans(routerIp, creds = null) {
     const sinEtiqueta = habilitados.length > 0 && habilitados.every(s => s.sinEtiqueta);
     return { success: true, servidores: res, vlans: activas, sinEtiqueta };
   } catch (error) {
-    try { await conn.close(); } catch { /* ya cerrada */ }
     console.error(`[PPPoEVlans] Error en ${routerIp}:`, error.message);
     return { success: false, servidores: [], vlans: [], message: error.message || 'Error leyendo el PPPoE server' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -503,6 +546,8 @@ async function clearFirewallAddressList(routerIp, listName, creds = null) {
   } catch (error) {
     console.error('[FirewallAddressList] Error:', error.message);
     return { success: false, message: error.message || 'Error limpiando address-list' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -620,8 +665,9 @@ async function removeAddressListByComments(routerIp, comments, creds = null) {
     };
   } catch (error) {
     console.error(`[FirewallAddressListByComment] ${routerIp} error:`, error.message);
-    try { await conn.close(); } catch (_) {}
     return { success: false, message: error.message || 'Error removiendo por comment' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -730,8 +776,9 @@ async function createMikrotikUser(routerIp, name, password, group, creds = null)
     };
   } catch (error) {
     console.error('[CreateUser] Error:', error.message);
-    try { await conn.close(); } catch (_) {}
     return { success: false, message: error.message || 'Error creando usuario' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -1120,8 +1167,9 @@ async function createModemNatRule(routerIp, pppUser, opts = {}, creds = null) {
     await conn.close();
     return { success: true, modemIp, dstPort, comment, link: `http://${publicHost}:${dstPort}`, message: `dst-nat creado: ${publicHost}:${dstPort} -> ${modemIp}:${modemPort}` };
   } catch (e) {
-    try { await conn.close(); } catch (_) {}
     return { success: false, message: e.message || 'Error creando dst-nat de modem' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -1142,8 +1190,9 @@ async function removeModemNatRule(routerIp, pppUser, creds = null) {
     await conn.close();
     return { success: true, removed: rules.length, comment, message: `${rules.length} regla(s) dst-nat removida(s)` };
   } catch (e) {
-    try { await conn.close(); } catch (_) {}
     return { success: false, message: e.message || 'Error removiendo dst-nat de modem' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
@@ -1174,8 +1223,9 @@ async function setPPPoEPassword(routerIp, pppUser, newPassword, opts = {}, creds
     await conn.close();
     return { success: true, disconnected, message: `Contraseña PPPoE de "${user}" actualizada${disconnected ? ' (sesión desconectada para reconectar)' : ''}` };
   } catch (e) {
-    try { await conn.close(); } catch (_) {}
     return { success: false, message: e.message || 'Error cambiando contraseña PPPoE' };
+  } finally {
+    await cerrarRouter(conn);
   }
 }
 
