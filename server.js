@@ -5,6 +5,7 @@ const cron = require('node-cron');
 const fetch = require('node-fetch');
 const { oltAutoFind, oltOnuState, oltAuthorizeOnu, oltListOnusFull, oltRebootOnu, oltFindAndRebootByPppoe, oltPlantilla, oltAuthorizeAprendido, oltConfigurarWan, oltAyudaOnu, oltComandoOnu, oltConfigPuerto, oltShowOnu, oltWifiOnu } = require('./olt-vsol');
 const { ucmStatus, ucmReboot } = require('./ucm-ssh');
+const { correrSesionesRouters } = require('./sesiones-routers');
 
 // Configuración
 const PORT = 3001;
@@ -1268,6 +1269,40 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Sesiones PPPoE de todos los routers al panel (opción C). { dryRun, incluirNombres, ids }.
+  // dryRun responde al terminar con el resumen; la corrida real responde de inmediato y sigue
+  // en segundo plano (el resultado queda en el journal). Ver sesiones-routers.js.
+  if (req.method === 'POST' && req.url === '/sesiones-routers/run') {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: 'Unauthorized' }));
+      return;
+    }
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', async () => {
+      let p = {};
+      try { p = body ? JSON.parse(body) : {}; } catch (_) {}
+      const opciones = {
+        listarSesiones: listActivePPPoESessions,
+        dryRun: p.dryRun === true,
+        incluirNombres: p.incluirNombres === true,
+        ids: Array.isArray(p.ids) ? p.ids : null,
+      };
+      if (opciones.dryRun) {
+        const r = await correrSesionesRouters(opciones);
+        res.writeHead(r.success ? 200 : 409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(r));
+        return;
+      }
+      res.writeHead(202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, message: 'Corrida iniciada' }));
+      correrSesionesRouters(opciones).catch(console.error);
+    });
+    return;
+  }
+
   // Ping endpoint
   if (req.method === 'POST' && req.url === '/ping') {
     // Verificar API key
@@ -2136,6 +2171,16 @@ server.listen(PORT, () => {
     console.log('\n[Cron] Ejecutando monitoreo programado...');
     runMonitoringCycle().catch(console.error);
   });
+
+  // Sesiones PPPoE por router al panel, minuto 10 (lejos del :00 de tickets y antes del :20 en
+  // que el panel sincroniza). Apagado salvo SESIONES_ROUTERS_CRON=on. Ver sesiones-routers.js.
+  if (process.env.SESIONES_ROUTERS_CRON === 'on') {
+    cron.schedule('10 * * * *', () => {
+      console.log('\n[Cron] Sesiones por router...');
+      correrSesionesRouters({ listarSesiones: listActivePPPoESessions }).catch(console.error);
+    });
+    console.log(`⏰ Cron de sesiones por router: minuto 10`);
+  }
 
   console.log(`\n✅ Servidor listo y cron configurado\n`);
 
