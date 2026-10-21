@@ -967,6 +967,13 @@ function elegirFormaAuth(authPuerto, auth, { usable = null } = {}) {
 const PORTID_RE = /\bportid\s+\d+/i;
 const tienePortid = (lineas) => lineas.some(l => PORTID_RE.test(l));
 /**
+ * El `portid` del gemport lo numera la OLT para cada ONU (145, 146, 147… en Otlazintla PON 2):
+ * comparando con el, cada bloque completo salia distinto y dos ONUs a medias (solo `onu add`)
+ * ganaban como forma del puerto (HCBD 2026-10-21). Se quita al aprender y al comparar; el
+ * gemport sin portid lo acepta la OLT y lo numera sola (probado en Otlazintla 2:48 ese dia).
+ */
+const quitarPortid = (l) => l.replace(/(\bgemport\s+\d+\s+tcont\s+\d+\b.*?)\s+portid\s+\d+\b/i, '$1');
+/**
  * Forma que de verdad deja la ONU con servicio: perfil line/srv, o service/service-port.
  * Lo que la OLT agrega sola con auto-learn (`onu add N profile default sn …`, a veces mas
  * `onu N profile onu default`) no cuenta: copiarlo deja la ONU sin VLAN.
@@ -1046,8 +1053,13 @@ function formaPorPuertos(todas, fOlt) {
 
 function elegirFormaAuthBase(authPuerto, auth) {
   const conLineas = (bs) => bs.filter(b => b.length);
-  const puerto = conLineas(authPuerto);
-  const todas = conLineas(auth);
+  // Con bloques completos en el grupo, los que la OLT agrego a medias no compiten: si no,
+  // dos a medias identicas ganaban a 46 completas (Otlazintla PON 2, HCBD 2026-10-21).
+  const soloCompletas = (bs) => (bs.some(formaCompleta) ? bs.filter(formaCompleta) : bs);
+  const todas = soloCompletas(conLineas(auth));
+  // Puerto con solo ONUs a medias y la OLT con completas: el puerto no tiene de que aprender.
+  const puertoCrudo = conLineas(authPuerto);
+  const puerto = !puertoCrudo.some(formaCompleta) && todas.some(formaCompleta) ? [] : soloCompletas(puertoCrudo);
   const fOlt = formaMasComun(todas);
   const fOltVsol = formaMasComun(todas.filter(b => b.vsol));
   const deOlt = (motivo) => {
@@ -1107,7 +1119,7 @@ function aprenderPlantillas(output, { slot = 0, ponPort = null, onuId = null, te
       const n = normalizarLinea(l, id);
       return epon && esLineaWifi24(n) ? n.replace(CANAL_RE, '$1{CANAL}') : n;
     };
-    const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm);
+    const a = lines.filter(l => !esLineaPri(l) && !esLineaDesc(l)).map(norm).map(quitarPortid);
     const p = lines.filter(l => esLineaPri(l) && !EQUID_RE.test(l)).map(norm);
     // V-SOL = SN de V-SOL (VSOL/GPON/MONU) o con config `pri`: las de otra marca van en
     // bridge y la OLT no les escribe `pri`. Se marca en el propio arreglo.
@@ -1426,7 +1438,7 @@ async function oltAuthorizeAprendido(oltCfg, { ponPort, sn, desc, dryRun = false
       // Ya existe (p.ej. la OLT la autorizo sola), pero a veces solo con `onu add … profile
       // default` y sin VLAN/servicio: el PPPoE nunca llega al router (CILK, Palma Real
       // 2026-10-06). Se le agregan las lineas de la plantilla que le falten.
-      const tiene = new Set((parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${dup.onuId}`) || []).map(l => l.trim().toLowerCase()));
+      const tiene = new Set((parseOnuBlocks(cfg).get(`${slot}/${ponPort}:${dup.onuId}`) || []).map(l => quitarPortid(l).trim().toLowerCase()));
       const faltan = llenarPlantilla(plantilla.auth.lineas, { ID: dup.onuId, SN: sn })
         .filter(l => !/^onu\s+add\b/i.test(l) && !tiene.has(l.trim().toLowerCase()));
       if (!faltan.length || dryRun) {
@@ -1847,7 +1859,7 @@ module.exports = {
   oltAyudaOnu,
   oltComandoOnu, oltConfigPuerto, oltShowOnu, oltWifiOnu, nombreSsidDeSalida,
   parseOnuBlocks,
-  aprenderPlantillas, elegirFormaAuth,
+  aprenderPlantillas, elegirFormaAuth, quitarPortid,
   perfilesDefinidos, authDePerfilesPropios, perfilesQueFaltan, vlanDeServicio,
   oltPlantilla,
   oltAuthorizeAprendido,
